@@ -33,3 +33,11 @@ python3 -m python_rewrite.simtester_tools --readers reader0 file --start-df 3F00
 ```
 
 `python_rewrite/de/srlabs/simtester/SIMTester.py` remains a compatibility shim forwarding to this module.
+
+
+Reader detection uses full system reader names (via pyscard/PCSC when available).
+You can list them with:
+
+```bash
+python3 -m python_rewrite.simtester_tools --list-readers
+```

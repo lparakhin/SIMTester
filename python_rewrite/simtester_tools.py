@@ -16,6 +16,9 @@ def to_hex(data: bytes | bytearray | None) -> str:
     return bytes(data).hex().upper() if data else ""
 
 
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "reader"
+
 @dataclass(frozen=True)
 class FuzzerData:
     name: str
@@ -46,7 +49,8 @@ class CSVWriter:
         self._path: Path | None = None
         self._fp = None
         if logging:
-            self._path = Path(f".{scan_type}_{reader_name}_{iccid}_{int(time.time()*1000)}.csv")
+            safe_reader = _safe_filename(reader_name)
+            self._path = Path(f".{scan_type}_{safe_reader}_{iccid}_{int(time.time()*1000)}.csv")
             self._fp = self._path.open("w", encoding="utf-8")
 
     def write_raw_line(self, line: str) -> None:
@@ -107,9 +111,29 @@ class ReaderBackend:
 
 
 def detect_available_readers() -> list[str]:
-    # pluggable: can be wired to pyscard discovery
-    env = os.getenv("SIMTESTER_READERS", "reader0,reader1")
-    return [r.strip() for r in env.split(",") if r.strip()]
+    """Return full reader names detected on the host system.
+
+    Detection order:
+    1) pyscard/PCSC (`smartcard.System.readers`)
+    2) SIMTESTER_READERS env var (comma-separated)
+    3) built-in fallback names
+    """
+    try:
+        from smartcard.System import readers as pcsc_readers
+
+        detected = [str(r) for r in pcsc_readers()]
+        if detected:
+            return detected
+    except Exception:
+        pass
+
+    env = os.getenv("SIMTESTER_READERS", "")
+    if env.strip():
+        detected = [r.strip() for r in env.split(",") if r.strip()]
+        if detected:
+            return detected
+
+    return ["PC/SC Reader 0 (fallback)", "PC/SC Reader 1 (fallback)"]
 
 
 def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) -> None:
@@ -272,7 +296,8 @@ def interactive_menu() -> list[str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="simtester-tools")
     parser.add_argument("--menu", action="store_true", help="Open interactive menu before scanning")
-    parser.add_argument("--readers", default="reader0", help="Comma-separated reader names")
+    parser.add_argument("--readers", default="", help="Comma-separated reader names (full names accepted)")
+    parser.add_argument("--list-readers", action="store_true", help="List detected SIM readers and exit")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
     apdu = sub.add_parser("apdu")
@@ -310,12 +335,20 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         argv = ["--menu"]
 
+    if "--list-readers" in argv:
+        for idx, name in enumerate(detect_available_readers(), start=1):
+            print(f"{idx}. {name}")
+        return 0
+
     if "--menu" in argv:
         argv = [x for x in argv if x != "--menu"]
         argv = interactive_menu()
 
     args = parser.parse_args(argv)
-    readers = [r.strip() for r in args.readers.split(",") if r.strip()]
+    if args.readers.strip():
+        readers = [r.strip() for r in args.readers.split(",") if r.strip()]
+    else:
+        readers = detect_available_readers()
 
     with ThreadPoolExecutor(max_workers=len(readers)) as ex:
         futures = {ex.submit(_run_for_reader, r, args): r for r in readers}
