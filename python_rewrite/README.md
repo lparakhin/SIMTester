@@ -51,3 +51,13 @@ The TAR menu now includes `scanWellKnownTARs` that uses a curated, cross-vendor 
 ## APDU GET RESPONSE support
 
 For APDU statuses that indicate continuation data (`61xx` / `9Fxx`), the scanner now automatically issues `GET RESPONSE` (`CLA C0 00 00 Le`) and decodes both responses in human-readable form.
+
+
+TAR scan output now includes human family labels (e.g., WIB family detected, S@T family detected, vendor profile hints).
+
+
+For TAR scans you can test multiple well-known keysets in one run using `--keysets`, for example:
+
+```bash
+python3 -m python_rewrite.simtester_tools --allow-dummy tar --mode scanWellKnownTARs --keysets 1,3,5
+```

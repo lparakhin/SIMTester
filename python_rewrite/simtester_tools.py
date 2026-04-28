@@ -125,6 +125,29 @@ WELL_KNOWN_TARS = {
     "Generic OTA/RFM": ["RAM:000000", "RFM:00000A", "RFM:3F0000", "RFM:800001"],
 }
 
+
+
+def classify_tar(tar_hex: str) -> str:
+    upper = tar_hex.upper()
+    if upper.startswith("0000") or upper.startswith("BFFF"):
+        return "WIB family detected"
+    if upper in {"505348", "534054"}:
+        return "S@T family detected"
+    if upper.startswith("B0") or upper.startswith("B1"):
+        return "RFM / OTA management family detected"
+    if upper == "000000":
+        return "RAM/Generic OTA TAR detected"
+    return "Unknown/other TAR family"
+
+
+def tar_human_name(tar_hex: str) -> str:
+    upper = tar_hex.upper()
+    for vendor, tars in WELL_KNOWN_TARS.items():
+        for t in tars:
+            if t.split(":")[1] == upper:
+                return f"{vendor} profile"
+    return classify_tar(upper)
+
 def get_well_known_tars() -> list[str]:
     merged: list[str] = []
     for values in WELL_KNOWN_TARS.values():
@@ -305,7 +328,7 @@ def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) ->
                 writer.write_line(reader.name, apdu2, resp2_full, decoded2)
 
 
-def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, start: str, regex: str | None = None) -> None:
+def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, start: str, regex: str | None = None, keysets: list[int] | None = None) -> None:
     patt = re.compile(regex) if regex else None
     if mode == "scanAllTARs":
         values = range(int(start, 16), 0x1000000)
@@ -315,14 +338,19 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
     else:
         values = range(0x000000, 0x010000)
         tar_iter = (i.to_bytes(3, "big") for i in values)
+    keyset_list = keysets if keysets else [keyset]
     for tar in tar_iter:
-        resp = reader.test_tar(tar, keyset)
-        hx = to_hex(resp)
-        if patt and not patt.search(hx):
-            continue
-        decoded = decode_apdu_response(resp[:-2] if len(resp) > 2 else resp)
-        print(f"[{reader.name}] TAR {to_hex(tar)} -> {hx} | {decoded}")
-        writer.write_raw_line(f"{to_hex(tar)},{hx},{decoded}")
+        tar_hex = to_hex(tar)
+        tar_desc = tar_human_name(tar_hex)
+        for ks in keyset_list:
+            resp = reader.test_tar(tar, ks)
+            hx = to_hex(resp)
+            if patt and not patt.search(hx):
+                continue
+            decoded = decode_apdu_response(resp[:-2] if len(resp) > 2 else resp)
+            human = f"{tar_desc}; keyset={ks}"
+            print(f"[{reader.name}] TAR {tar_hex} ({human}) -> {hx} | {decoded}")
+            writer.write_raw_line(f"{tar_hex},{ks},{human},{hx},{decoded}")
 
 
 def ota_fuzz(reader: ReaderBackend, writer: CSVWriter, keyset: int, tar: str, fuzzer_id: int, bruteforce: bool) -> None:
@@ -360,7 +388,7 @@ def _run_for_reader(reader_name: str, args) -> str:
         if args.cmd == "apdu":
             apdu_scan(reader, writer, args.level2)
         elif args.cmd == "tar":
-            tar_scan(reader, writer, args.mode, args.keyset, args.start, args.regex)
+            tar_scan(reader, writer, args.mode, args.keyset, args.start, args.regex, args.keysets)
         elif args.cmd == "ota":
             ota_fuzz(reader, writer, args.keyset, args.tar, args.fuzzer, args.bruteforce)
         elif args.cmd == "file":
@@ -412,7 +440,10 @@ def interactive_menu() -> list[str]:
         for vendor, tars in WELL_KNOWN_TARS.items():
             print(f"  - {vendor}: {', '.join(tars[:4])}")
         argv += ["--mode", _menu("TAR mode", ["scanRangesOfTARs", "scanAllTARs", "scanWellKnownTARs"])]
-        argv += ["--keyset", _input_default("Keyset (0-15)", "1")]
+        argv += ["--keyset", _input_default("Primary keyset (0-15)", "1")]
+        multi_keysets = _input_default("Try multiple keysets (comma list, blank=disabled)", "")
+        if multi_keysets:
+            argv += ["--keysets", multi_keysets]
         argv += ["--start", _input_default("Starting TAR (hex, 6 chars)", "000000").upper()]
     elif action == "ota":
         argv += ["--keyset", _input_default("Keyset (0-15)", "1")]
@@ -446,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     tar.add_argument("--keyset", type=int, default=1)
     tar.add_argument("--start", default="000000")
     tar.add_argument("--regex")
+    tar.add_argument("--keysets", type=lambda x: [int(i) for i in x.split(",")], default=None, help="Try multiple keysets, e.g. 1,3,5")
 
     ota = sub.add_parser("ota")
     ota.add_argument("--keyset", type=int, default=1)
