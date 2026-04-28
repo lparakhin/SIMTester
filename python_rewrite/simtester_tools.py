@@ -20,6 +20,22 @@ def _safe_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "reader"
 
 
+def decode_atr(atr: bytes) -> str:
+    if not atr:
+        return "ATR unavailable"
+    ts = atr[0]
+    ts_desc = "direct convention" if ts == 0x3B else ("inverse convention" if ts == 0x3F else "unknown convention")
+    t0 = atr[1] if len(atr) > 1 else 0
+    k = t0 & 0x0F
+    y = (t0 & 0xF0) >> 4
+    return f"ATR={to_hex(atr)}; {ts_desc}; historical_bytes={k}; interface_bytes_mask=0x{y:X}"
+
+
+def log_reader_atr(reader: "ReaderBackend") -> None:
+    atr = reader.get_atr()
+    print(f"[{reader.name}] {decode_atr(atr)}")
+
+
 def decode_sw(sw1: int, sw2: int) -> str:
     sw = (sw1 << 8) | sw2
     exact = {
@@ -96,8 +112,8 @@ def tar_detected(resp: bytes) -> bool:
 
 
 
-def _tlv_name(tag: int) -> str:
-    return {
+def _tlv_name(tag: int, context: str = "apdu") -> str:
+    base = {
         0x62: "FCP template",
         0x6F: "FCI template",
         0xA5: "FCI proprietary template",
@@ -116,7 +132,10 @@ def _tlv_name(tag: int) -> str:
         0xD0: "Proactive SIM command",
         0xD1: "SMS-PP download",
         0xD3: "Cell broadcast download",
-    }.get(tag, f"Tag {tag:02X}")
+    }
+    if context == "tar" and tag == 0x83:
+        return "TAR response parameter"
+    return base.get(tag, f"Tag {tag:02X}")
 
 
 def _parse_tlv_tree(data: bytes) -> list[tuple[int, bytes]]:
@@ -136,7 +155,7 @@ def _decode_file_descriptor(v: bytes) -> str:
     return f"{file_type}, structure={structure}"
 
 
-def decode_3gpp_tlvs(data: bytes, depth: int = 0) -> str:
+def decode_3gpp_tlvs(data: bytes, depth: int = 0, context: str = "apdu") -> str:
     if not data:
         return ""
     tlvs = _parse_tlv_tree(data)
@@ -155,7 +174,7 @@ def decode_3gpp_tlvs(data: bytes, depth: int = 0) -> str:
         return ""
     parts: list[str] = []
     for tag, value in tlvs:
-        name = _tlv_name(tag)
+        name = _tlv_name(tag, context=context)
         extra = ""
         if tag == 0x82:
             extra = _decode_file_descriptor(value)
@@ -171,30 +190,30 @@ def decode_3gpp_tlvs(data: bytes, depth: int = 0) -> str:
         parts.append(line)
 
         if tag in {0x62, 0x6F, 0xA5, 0x7C}:
-            nested = decode_3gpp_tlvs(value, depth + 1)
+            nested = decode_3gpp_tlvs(value, depth + 1, context=context)
             if nested:
                 parts.append(nested)
     return "; ".join(parts)
 
 
-def analyze_response(sw1: int, sw2: int, body: bytes) -> str:
+def analyze_response(sw1: int, sw2: int, body: bytes, context: str = "apdu") -> str:
     notes = [decode_sw(sw1, sw2)]
     if sw1 in {0x61, 0x9F}:
         notes.append("Follow-up GET RESPONSE recommended")
     if sw1 == 0x91:
         notes.append("Proactive command pending (FETCH path)")
     if body and body[0] in {0x62, 0x6F, 0xA5, 0x7C, 0xD0, 0xD1, 0xD3}:
-        tlv_decoded = decode_3gpp_tlvs(body)
+        tlv_decoded = decode_3gpp_tlvs(body, context=context)
         if tlv_decoded:
             notes.append("3GPP/ETSI decode: " + tlv_decoded)
     return " | ".join(notes)
 
-def decode_apdu_response(resp: bytes) -> str:
+def decode_apdu_response(resp: bytes, context: str = "apdu") -> str:
     if len(resp) < 2:
         return "Malformed APDU response"
     sw1, sw2 = resp[-2], resp[-1]
     body = resp[:-2]
-    return analyze_response(sw1, sw2, body)
+    return analyze_response(sw1, sw2, body, context=context)
 
 
 @dataclass(frozen=True)
@@ -344,6 +363,14 @@ class ReaderBackend:
             f"Reason: {last_error}. Insert card or rerun with --allow-dummy to continue."
         )
 
+    def get_atr(self) -> bytes:
+        if self._conn:
+            try:
+                return bytes(self._conn.getATR())
+            except Exception:
+                return b""
+        return b""
+
     def transmit(self, apdu: bytes) -> bytes:
         if self._conn:
             data, sw1, sw2 = self._conn.transmit(list(apdu))
@@ -404,13 +431,14 @@ def detect_available_readers() -> list[str]:
 
 
 def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) -> None:
+    log_reader_atr(reader)
     print(f"[{reader.name}] Starting APDU scan ({'L2' if level2 else 'L1'})")
     for cla in range(0x100):
         apdu = bytes((cla, 0, 0, 0, 0))
         resp = reader.transmit(apdu)
         resp_full = reader.maybe_get_response(apdu, resp)
         parts = resp_full.split(b"|")
-        decoded = " || ".join(decode_apdu_response(p) for p in parts)
+        decoded = " || ".join(decode_apdu_response(p, context="apdu") for p in parts)
         print(f"[{reader.name}] APDU {to_hex(apdu)} -> {to_hex(resp_full)} | {decoded}")
         if not level2:
             writer.write_line(reader.name, apdu, resp_full, decoded)
@@ -422,12 +450,13 @@ def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) ->
                 apdu2 = bytes((cla, ins, 0, 0, 0))
                 resp2 = reader.transmit(apdu2)
                 resp2_full = reader.maybe_get_response(apdu2, resp2)
-                decoded2 = " || ".join(decode_apdu_response(p) for p in resp2_full.split(b"|"))
+                decoded2 = " || ".join(decode_apdu_response(p, context="apdu") for p in resp2_full.split(b"|"))
                 print(f"[{reader.name}] APDU {to_hex(apdu2)} -> {to_hex(resp2_full)} | {decoded2}")
                 writer.write_line(reader.name, apdu2, resp2_full, decoded2)
 
 
 def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, start: str, regex: str | None = None, keysets: list[int] | None = None) -> None:
+    log_reader_atr(reader)
     patt = re.compile(regex) if regex else None
     if mode == "scanAllTARs":
         values = range(int(start, 16), 0x1000000)
@@ -448,7 +477,7 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
             hx = to_hex(resp_full)
             if patt and not patt.search(hx):
                 continue
-            decoded = " || ".join(decode_apdu_response(p) for p in resp_full.split(b"|"))
+            decoded = " || ".join(decode_apdu_response(p, context="tar") for p in resp_full.split(b"|"))
             if not tar_detected(resp):
                 # skip noisy non-detections
                 continue
@@ -458,6 +487,7 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
 
 
 def ota_fuzz(reader: ReaderBackend, writer: CSVWriter, keyset: int, tar: str, fuzzer_id: int, bruteforce: bool) -> None:
+    log_reader_atr(reader)
     fuzzer = FUZZERS.get(fuzzer_id)
     if not fuzzer:
         raise ValueError(f"Unknown fuzzer: {fuzzer_id}")
@@ -466,12 +496,13 @@ def ota_fuzz(reader: ReaderBackend, writer: CSVWriter, keyset: int, tar: str, fu
     for pid in pid_values:
         for dcs in dcs_values:
             resp = reader.send_ota(pid, dcs, False, b"", keyset, tar, fuzzer)
-            decoded = decode_apdu_response(resp)
+            decoded = decode_apdu_response(resp, context="apdu")
             print(f"[{reader.name}] OTA pid={pid:02X} dcs={dcs:02X} -> {to_hex(resp)} | {decoded}")
             writer.write_raw_line(f"{pid:02X},{dcs:02X},{to_hex(resp)},{decoded}")
 
 
 def file_scan(reader: ReaderBackend, writer: CSVWriter, start_df: str, lazy_scan: bool) -> None:
+    log_reader_atr(reader)
     writer.write_raw_line("# path,type")
     for i in range(0x10000):
         if lazy_scan and not (0x2F00 <= i <= 0x2FFF or 0x7F00 <= i <= 0x7FFF or 0x6F00 <= i <= 0x6FFF):
