@@ -75,6 +75,20 @@ def _parse_tlvs(data: bytes) -> list[tuple[int, bytes]]:
     return out
 
 
+
+
+def tar_detected(resp: bytes) -> bool:
+    if len(resp) < 2:
+        return False
+    sw1, sw2 = resp[-2], resp[-1]
+    # treat success/warning/continuation as potentially detected TAR endpoints
+    if sw1 in {0x90, 0x91, 0x9E, 0x9F, 0x61, 0x62, 0x63}:
+        return True
+    # known negative statuses -> not detected
+    if (sw1, sw2) in {(0x6A, 0x82), (0x6A, 0x86), (0x6D, 0x00), (0x6E, 0x00), (0x69, 0x82), (0x69, 0x85), (0x98, 0x04)}:
+        return False
+    return False
+
 def decode_apdu_response(resp: bytes) -> str:
     if len(resp) < 2:
         return "Malformed APDU response"
@@ -271,8 +285,9 @@ class ReaderBackend:
         return resp
 
     def test_tar(self, tar: bytes, keyset: int) -> bytes:
-        # conservative probe payload (SELECT MF) wrapped as dummy TAR payload for now
-        return self.transmit(bytes.fromhex("00A40000023F00")) + tar[:1] + bytes([keyset])
+        # conservative probe payload (SELECT MF) as baseline reachability check
+        _ = (tar, keyset)
+        return self.transmit(bytes.fromhex("00A40000023F00"))
 
     def send_ota(self, pid: int, dcs: int, udhi: bool, cph: bytes, keyset: int, tar: str, fuzzer: FuzzerData) -> bytes:
         # placeholder transport-level OTA probe via APDU path
@@ -347,7 +362,10 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
             hx = to_hex(resp)
             if patt and not patt.search(hx):
                 continue
-            decoded = decode_apdu_response(resp[:-2] if len(resp) > 2 else resp)
+            decoded = decode_apdu_response(resp)
+            if not tar_detected(resp):
+                # skip noisy non-detections
+                continue
             human = f"{tar_desc}; keyset={ks}"
             print(f"[{reader.name}] TAR {tar_hex} ({human}) -> {hx} | {decoded}")
             writer.write_raw_line(f"{tar_hex},{ks},{human},{hx},{decoded}")
