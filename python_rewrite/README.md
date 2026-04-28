@@ -64,3 +64,6 @@ python3 -m python_rewrite.simtester_tools --allow-dummy tar --mode scanWellKnown
 
 
 TAR positive responses now trigger GET RESPONSE follow-up (`61xx`/`9Fxx`) and decoded analysis of returned bytes using 3GPP-oriented TLV interpretation.
+
+
+Decoder now performs deeper 3GPP/ETSI-style TLV interpretation for FCP/FCI templates (e.g., file descriptor, file identifier, life cycle status, security attributes, PIN status templates) when present.

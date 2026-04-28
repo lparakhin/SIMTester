@@ -96,25 +96,85 @@ def tar_detected(resp: bytes) -> bool:
 
 
 
-def decode_3gpp_tlvs(data: bytes) -> str:
-    tags = {
-        0xD0: "Proactive SIM command",
-        0xD1: "SMS-PP download",
-        0xD3: "Cell broadcast download",
+def _tlv_name(tag: int) -> str:
+    return {
         0x62: "FCP template",
-        0xA5: "Proprietary template",
+        0x6F: "FCI template",
+        0xA5: "FCI proprietary template",
+        0x7C: "Response message template",
         0x80: "File size",
         0x81: "Total file size",
         0x82: "File descriptor",
         0x83: "File identifier",
         0x84: "AID/DF name",
+        0x88: "Short File Identifier",
         0x8A: "Life cycle status",
         0x8B: "Security attributes",
-    }
-    tlvs = _parse_tlvs(data)
+        0x8C: "Security attributes (expanded)",
+        0x90: "PIN status template",
+        0xC6: "PIN status bytes",
+        0xD0: "Proactive SIM command",
+        0xD1: "SMS-PP download",
+        0xD3: "Cell broadcast download",
+    }.get(tag, f"Tag {tag:02X}")
+
+
+def _parse_tlv_tree(data: bytes) -> list[tuple[int, bytes]]:
+    return _parse_tlvs(data)
+
+
+def _decode_file_descriptor(v: bytes) -> str:
+    if not v:
+        return ""
+    b0 = v[0]
+    file_type = "DF" if (b0 & 0x38) == 0x38 else "EF"
+    structure = {
+        0x01: "transparent",
+        0x02: "linear fixed",
+        0x06: "cyclic",
+    }.get(b0 & 0x07, "unknown")
+    return f"{file_type}, structure={structure}"
+
+
+def decode_3gpp_tlvs(data: bytes, depth: int = 0) -> str:
+    if not data:
+        return ""
+    tlvs = _parse_tlv_tree(data)
+    if not tlvs:
+        # heuristic fallback: find embedded template start and retry
+        for marker in (0x62, 0x6F, 0xA5, 0x7C):
+            try:
+                idx = data.index(bytes([marker]))
+            except ValueError:
+                continue
+            if idx > 0:
+                tlvs = _parse_tlv_tree(data[idx:])
+                if tlvs:
+                    break
     if not tlvs:
         return ""
-    return "; ".join(f"{tags.get(t, 'Tag %02X' % t)}={to_hex(v)}" for t, v in tlvs[:12])
+    parts: list[str] = []
+    for tag, value in tlvs:
+        name = _tlv_name(tag)
+        extra = ""
+        if tag == 0x82:
+            extra = _decode_file_descriptor(value)
+        elif tag == 0x8A and value:
+            extra = {
+                0x01: "creation state",
+                0x05: "operational (activated)",
+                0x0C: "termination",
+            }.get(value[0], "unknown")
+        line = f"{name}={to_hex(value)}"
+        if extra:
+            line += f" ({extra})"
+        parts.append(line)
+
+        if tag in {0x62, 0x6F, 0xA5, 0x7C}:
+            nested = decode_3gpp_tlvs(value, depth + 1)
+            if nested:
+                parts.append(nested)
+    return "; ".join(parts)
 
 
 def analyze_response(sw1: int, sw2: int, body: bytes) -> str:
@@ -123,10 +183,10 @@ def analyze_response(sw1: int, sw2: int, body: bytes) -> str:
         notes.append("Follow-up GET RESPONSE recommended")
     if sw1 == 0x91:
         notes.append("Proactive command pending (FETCH path)")
-    if body and body[0] in {0x62, 0x6F, 0xA5, 0xD0, 0xD1, 0xD3}:
+    if body and body[0] in {0x62, 0x6F, 0xA5, 0x7C, 0xD0, 0xD1, 0xD3}:
         tlv_decoded = decode_3gpp_tlvs(body)
         if tlv_decoded:
-            notes.append("3GPP TLV: " + tlv_decoded)
+            notes.append("3GPP/ETSI decode: " + tlv_decoded)
     return " | ".join(notes)
 
 def decode_apdu_response(resp: bytes) -> str:
