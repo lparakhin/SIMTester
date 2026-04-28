@@ -1,0 +1,76 @@
+# Python Rewrite Manifest
+
+Generated from 62 Java files.
+
+## Generated modules
+- `__init__.py`
+- `de/__init__.py`
+- `de/srlabs/__init__.py`
+- `de/srlabs/simlib/APDUToolkit.py`
+- `de/srlabs/simlib/Address.py`
+- `de/srlabs/simlib/Auth.py`
+- `de/srlabs/simlib/AutoTerminalProfile.py`
+- `de/srlabs/simlib/ByteArray.py`
+- `de/srlabs/simlib/ChannelHandler.py`
+- `de/srlabs/simlib/CommandPacket.py`
+- `de/srlabs/simlib/CommonFileReader.py`
+- `de/srlabs/simlib/Debug.py`
+- `de/srlabs/simlib/DeviceIdentities.py`
+- `de/srlabs/simlib/EncodingToolkit.py`
+- `de/srlabs/simlib/Envelope.py`
+- `de/srlabs/simlib/EnvelopeSMSPPDownload.py`
+- `de/srlabs/simlib/FileManagement.py`
+- `de/srlabs/simlib/Helpers.py`
+- `de/srlabs/simlib/HexToolkit.py`
+- `de/srlabs/simlib/ISIMCardFileMapping.py`
+- `de/srlabs/simlib/InnerTLV.py`
+- `de/srlabs/simlib/LoggingUtils.py`
+- `de/srlabs/simlib/MFSimCardFileMapping.py`
+- `de/srlabs/simlib/OTASMS.py`
+- `de/srlabs/simlib/ProactiveCommand.py`
+- `de/srlabs/simlib/Range.py`
+- `de/srlabs/simlib/ResponsePacket.py`
+- `de/srlabs/simlib/SIMLibrary.py`
+- `de/srlabs/simlib/SMSDeliverTPDU.py`
+- `de/srlabs/simlib/SMSTPDU.py`
+- `de/srlabs/simlib/SelectResponse.py`
+- `de/srlabs/simlib/SelectResponse2G.py`
+- `de/srlabs/simlib/SelectResponse3G.py`
+- `de/srlabs/simlib/SimCardBerTlvFile.py`
+- `de/srlabs/simlib/SimCardCyclicFile.py`
+- `de/srlabs/simlib/SimCardDirectoryFile.py`
+- `de/srlabs/simlib/SimCardElementaryFile.py`
+- `de/srlabs/simlib/SimCardFile.py`
+- `de/srlabs/simlib/SimCardFileMapping.py`
+- `de/srlabs/simlib/SimCardLinearFixedFile.py`
+- `de/srlabs/simlib/SimCardMasterFile.py`
+- `de/srlabs/simlib/SimCardNoInfoFile.py`
+- `de/srlabs/simlib/SimCardTransparentFile.py`
+- `de/srlabs/simlib/TLVToolkit.py`
+- `de/srlabs/simlib/USIMCardFileMapping.py`
+- `de/srlabs/simlib/__init__.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoCard.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoCardChannel.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoCardTerminal.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoCardTerminals.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoJNI.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoProvider.py`
+- `de/srlabs/simlib/osmocardprovider/OsmoSpi.py`
+- `de/srlabs/simlib/osmocardprovider/__init__.py`
+- `de/srlabs/simtester/APDUScanner.py`
+- `de/srlabs/simtester/CSVWriter.py`
+- `de/srlabs/simtester/EntryPoint.py`
+- `de/srlabs/simtester/FileScanner.py`
+- `de/srlabs/simtester/Fuzzer.py`
+- `de/srlabs/simtester/FuzzerData.py`
+- `de/srlabs/simtester/FuzzerFactory.py`
+- `de/srlabs/simtester/FuzzerResult.py`
+- `de/srlabs/simtester/FuzzerResultComparator.py`
+- `de/srlabs/simtester/GSMMapUploader.py`
+- `de/srlabs/simtester/OTAFuzzer.py`
+- `de/srlabs/simtester/SIMTester.py`
+- `de/srlabs/simtester/TARScanner.py`
+- `de/srlabs/simtester/__init__.py`
+
+- `de/srlabs/simtester/_utils.py` (Python-native helper module)
+- `simtester_tools.py` (single-file combined tools + multi-reader support)
