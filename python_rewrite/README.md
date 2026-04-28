@@ -38,3 +38,6 @@ During scans, APDU responses are printed on-screen and decoded into human-readab
 ```bash
 python3 -m python_rewrite.simtester_tools --list-readers
 ```
+
+
+If a reader is present but no card is inserted, the tool now reports a clear per-reader error and continues with other readers.

@@ -172,21 +172,34 @@ class ReaderBackend:
         self._init_real_reader()
 
     def _init_real_reader(self) -> None:
+        last_error = None
         try:
             from smartcard.System import readers as pcsc_readers
 
-            for r in pcsc_readers():
-                if str(r) == self.name:
-                    conn = r.createConnection()
-                    conn.connect()
-                    self._conn = conn
-                    print(f"[{self.name}] connected to real SIM reader")
-                    return
+            matched = [r for r in pcsc_readers() if str(r) == self.name]
+            if not matched:
+                last_error = RuntimeError("Reader not found in current PC/SC list")
+            else:
+                for r in matched:
+                    try:
+                        conn = r.createConnection()
+                        conn.connect()
+                        self._conn = conn
+                        print(f"[{self.name}] connected to real SIM reader")
+                        return
+                    except Exception as exc:
+                        last_error = exc
         except Exception as exc:
-            if not self.allow_dummy:
-                raise RuntimeError(f"Unable to initialize real reader '{self.name}': {exc}") from exc
+            last_error = exc
+
         if self.allow_dummy:
-            print(f"[{self.name}] WARNING: using dummy transport")
+            print(f"[{self.name}] WARNING: real reader unavailable ({last_error}); using dummy transport")
+            return
+
+        raise RuntimeError(
+            f"Unable to initialize real reader '{self.name}'. "
+            f"Reason: {last_error}. Insert card or rerun with --allow-dummy to continue."
+        )
 
     def transmit(self, apdu: bytes) -> bytes:
         if self._conn:
@@ -294,19 +307,22 @@ def file_scan(reader: ReaderBackend, writer: CSVWriter, start_df: str, lazy_scan
 
 
 def _run_for_reader(reader_name: str, args) -> str:
-    reader = ReaderBackend(reader_name, allow_dummy=args.allow_dummy)
-    writer = CSVWriter("UNKNOWN", args.cmd.upper(), reader_name)
-    if args.cmd == "apdu":
-        apdu_scan(reader, writer, args.level2)
-    elif args.cmd == "tar":
-        tar_scan(reader, writer, args.mode, args.keyset, args.start, args.regex)
-    elif args.cmd == "ota":
-        ota_fuzz(reader, writer, args.keyset, args.tar, args.fuzzer, args.bruteforce)
-    elif args.cmd == "file":
-        file_scan(reader, writer, args.start_df, args.lazy)
-    elif args.cmd == "fuzz":
-        writer.write_raw_line(f"# fuzz action selected: TARs={','.join(args.tars)} keysets={args.keysets} fuzzers={args.fuzzers}")
-    return writer.unhide()
+    try:
+        reader = ReaderBackend(reader_name, allow_dummy=args.allow_dummy)
+        writer = CSVWriter("UNKNOWN", args.cmd.upper(), reader_name)
+        if args.cmd == "apdu":
+            apdu_scan(reader, writer, args.level2)
+        elif args.cmd == "tar":
+            tar_scan(reader, writer, args.mode, args.keyset, args.start, args.regex)
+        elif args.cmd == "ota":
+            ota_fuzz(reader, writer, args.keyset, args.tar, args.fuzzer, args.bruteforce)
+        elif args.cmd == "file":
+            file_scan(reader, writer, args.start_df, args.lazy)
+        elif args.cmd == "fuzz":
+            writer.write_raw_line(f"# fuzz action selected: TARs={','.join(args.tars)} keysets={args.keysets} fuzzers={args.fuzzers}")
+        return writer.unhide()
+    except Exception as exc:
+        return f"ERROR: {exc}"
 
 
 def _menu(prompt: str, options: list[str], default: int = 0) -> str:
@@ -419,11 +435,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     readers = [r.strip() for r in args.readers.split(",") if r.strip()] if args.readers.strip() else detect_available_readers()
 
+    failures = 0
     with ThreadPoolExecutor(max_workers=len(readers)) as ex:
         futures = {ex.submit(_run_for_reader, r, args): r for r in readers}
         for fut in as_completed(futures):
-            print(f"[{futures[fut]}] wrote {fut.result()}")
-    return 0
+            res = fut.result()
+            reader_name = futures[fut]
+            if res.startswith("ERROR:"):
+                failures += 1
+                print(f"[{reader_name}] {res}")
+            else:
+                print(f"[{reader_name}] wrote {res}")
+    return 1 if failures == len(readers) else 0
 
 
 if __name__ == "__main__":
