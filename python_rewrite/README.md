@@ -41,3 +41,13 @@ python3 -m python_rewrite.simtester_tools --list-readers
 
 
 If a reader is present but no card is inserted, the tool now reports a clear per-reader error and continues with other readers.
+
+
+## TAR scanner well-known option
+
+The TAR menu now includes `scanWellKnownTARs` that uses a curated, cross-vendor TAR catalog (Gemalto/Thales, G+D, IDEMIA/OT, WIB/S@T, generic OTA/RFM).
+
+
+## APDU GET RESPONSE support
+
+For APDU statuses that indicate continuation data (`61xx` / `9Fxx`), the scanner now automatically issues `GET RESPONSE` (`CLA C0 00 00 Le`) and decodes both responses in human-readable form.

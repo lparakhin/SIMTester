@@ -116,6 +116,28 @@ FUZZERS = {
 }
 DEFAULT_TARS = ["RAM:000000", "WIB:000001", "WIB:000002", "RFM:00000A", "SAT:505348", "RFM:FFFFFF"]
 
+# Curated cross-vendor / ecosystem list (publicly observed/default TAR families)
+WELL_KNOWN_TARS = {
+    "Gemalto/Thales": ["RFM:B00001", "RFM:B00145", "RFM:FFFFFF"],
+    "Giesecke+Devrient": ["RFM:B00010", "RFM:B00040", "RFM:B00050"],
+    "IDEMIA/OT": ["RFM:B00120", "RFM:B00140", "RFM:B00141"],
+    "STK/WIB/S@T": ["WIB:000001", "WIB:BFFF00", "SAT:505348", "SAT:534054"],
+    "Generic OTA/RFM": ["RAM:000000", "RFM:00000A", "RFM:3F0000", "RFM:800001"],
+}
+
+def get_well_known_tars() -> list[str]:
+    merged: list[str] = []
+    for values in WELL_KNOWN_TARS.values():
+        merged.extend(values)
+    # stable unique
+    seen = set()
+    out = []
+    for t in merged:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 
 class CSVWriter:
     def __init__(self, iccid: str, scan_type: str, reader_name: str, logging: bool = True):
@@ -209,6 +231,22 @@ class ReaderBackend:
             return apdu[:2] + b"\x90\x00"
         raise RuntimeError(f"No real reader connection for {self.name}")
 
+
+    def maybe_get_response(self, original_apdu: bytes, resp: bytes) -> bytes:
+        if len(resp) < 2:
+            return resp
+        sw1, sw2 = resp[-2], resp[-1]
+        # ISO7816 GET RESPONSE for 61xx/9Fxx style continuation
+        if sw1 in {0x61, 0x9F}:
+            cla = original_apdu[0] if original_apdu else 0x00
+            get_resp = bytes((cla, 0xC0, 0x00, 0x00, sw2))
+            try:
+                extra = self.transmit(get_resp)
+                return resp + b"|" + extra
+            except Exception:
+                return resp
+        return resp
+
     def test_tar(self, tar: bytes, keyset: int) -> bytes:
         # conservative probe payload (SELECT MF) wrapped as dummy TAR payload for now
         return self.transmit(bytes.fromhex("00A40000023F00")) + tar[:1] + bytes([keyset])
@@ -248,10 +286,12 @@ def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) ->
     for cla in range(0x100):
         apdu = bytes((cla, 0, 0, 0, 0))
         resp = reader.transmit(apdu)
-        decoded = decode_apdu_response(resp)
-        print(f"[{reader.name}] APDU {to_hex(apdu)} -> {to_hex(resp)} | {decoded}")
+        resp_full = reader.maybe_get_response(apdu, resp)
+        parts = resp_full.split(b"|")
+        decoded = " || ".join(decode_apdu_response(p) for p in parts)
+        print(f"[{reader.name}] APDU {to_hex(apdu)} -> {to_hex(resp_full)} | {decoded}")
         if not level2:
-            writer.write_line(reader.name, apdu, resp, decoded)
+            writer.write_line(reader.name, apdu, resp_full, decoded)
         sw = int.from_bytes(resp[-2:], "big") if len(resp) >= 2 else 0xFFFF
         if sw in {0x6E00, 0x6881, 0x6882}:
             continue
@@ -259,16 +299,23 @@ def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) ->
             for ins in range(0x100):
                 apdu2 = bytes((cla, ins, 0, 0, 0))
                 resp2 = reader.transmit(apdu2)
-                decoded2 = decode_apdu_response(resp2)
-                print(f"[{reader.name}] APDU {to_hex(apdu2)} -> {to_hex(resp2)} | {decoded2}")
-                writer.write_line(reader.name, apdu2, resp2, decoded2)
+                resp2_full = reader.maybe_get_response(apdu2, resp2)
+                decoded2 = " || ".join(decode_apdu_response(p) for p in resp2_full.split(b"|"))
+                print(f"[{reader.name}] APDU {to_hex(apdu2)} -> {to_hex(resp2_full)} | {decoded2}")
+                writer.write_line(reader.name, apdu2, resp2_full, decoded2)
 
 
 def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, start: str, regex: str | None = None) -> None:
     patt = re.compile(regex) if regex else None
-    values = range(int(start, 16), 0x1000000) if mode == "scanAllTARs" else range(0x000000, 0x010000)
-    for i in values:
-        tar = i.to_bytes(3, "big")
+    if mode == "scanAllTARs":
+        values = range(int(start, 16), 0x1000000)
+        tar_iter = (i.to_bytes(3, "big") for i in values)
+    elif mode == "scanWellKnownTARs":
+        tar_iter = (bytes.fromhex(t.split(":")[1]) for t in get_well_known_tars())
+    else:
+        values = range(0x000000, 0x010000)
+        tar_iter = (i.to_bytes(3, "big") for i in values)
+    for tar in tar_iter:
         resp = reader.test_tar(tar, keyset)
         hx = to_hex(resp)
         if patt and not patt.search(hx):
@@ -361,7 +408,10 @@ def interactive_menu() -> list[str]:
     if action == "apdu" and _menu("APDU scan level", ["level1", "level2"]) == "level2":
         argv.append("--level2")
     elif action == "tar":
-        argv += ["--mode", _menu("TAR mode", ["scanRangesOfTARs", "scanAllTARs"])]
+        print("Known TAR catalogs:")
+        for vendor, tars in WELL_KNOWN_TARS.items():
+            print(f"  - {vendor}: {', '.join(tars[:4])}")
+        argv += ["--mode", _menu("TAR mode", ["scanRangesOfTARs", "scanAllTARs", "scanWellKnownTARs"])]
         argv += ["--keyset", _input_default("Keyset (0-15)", "1")]
         argv += ["--start", _input_default("Starting TAR (hex, 6 chars)", "000000").upper()]
     elif action == "ota":
@@ -376,7 +426,7 @@ def interactive_menu() -> list[str]:
         argv += ["--tars", _input_default("TARs (comma list)", ",".join(DEFAULT_TARS[:3]))]
 
     if _menu("Allow dummy reader fallback?", ["no", "yes"]) == "yes":
-        argv.append("--allow-dummy")
+        argv = ["--allow-dummy"] + argv
     return argv
 
 
@@ -392,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
     apdu.add_argument("--level2", action="store_true")
 
     tar = sub.add_parser("tar")
-    tar.add_argument("--mode", choices=["scanAllTARs", "scanRangesOfTARs"], default="scanRangesOfTARs")
+    tar.add_argument("--mode", choices=["scanAllTARs", "scanRangesOfTARs", "scanWellKnownTARs"], default="scanRangesOfTARs")
     tar.add_argument("--keyset", type=int, default=1)
     tar.add_argument("--start", default="000000")
     tar.add_argument("--regex")
