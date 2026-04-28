@@ -34,6 +34,11 @@ def decode_sw(sw1: int, sw2: int) -> str:
         0x6A86: "Incorrect P1/P2",
         0x6D00: "Instruction code not supported",
         0x6E00: "Class not supported",
+        0x6A84: "Not enough memory space",
+        0x6700: "Wrong length",
+        0x6881: "Logical channel not supported",
+        0x6882: "Secure messaging not supported",
+        0x9300: "SIM Toolkit busy",
     }
     if sw in exact:
         return exact[sw]
@@ -89,28 +94,47 @@ def tar_detected(resp: bytes) -> bool:
         return False
     return False
 
+
+
+def decode_3gpp_tlvs(data: bytes) -> str:
+    tags = {
+        0xD0: "Proactive SIM command",
+        0xD1: "SMS-PP download",
+        0xD3: "Cell broadcast download",
+        0x62: "FCP template",
+        0xA5: "Proprietary template",
+        0x80: "File size",
+        0x81: "Total file size",
+        0x82: "File descriptor",
+        0x83: "File identifier",
+        0x84: "AID/DF name",
+        0x8A: "Life cycle status",
+        0x8B: "Security attributes",
+    }
+    tlvs = _parse_tlvs(data)
+    if not tlvs:
+        return ""
+    return "; ".join(f"{tags.get(t, 'Tag %02X' % t)}={to_hex(v)}" for t, v in tlvs[:12])
+
+
+def analyze_response(sw1: int, sw2: int, body: bytes) -> str:
+    notes = [decode_sw(sw1, sw2)]
+    if sw1 in {0x61, 0x9F}:
+        notes.append("Follow-up GET RESPONSE recommended")
+    if sw1 == 0x91:
+        notes.append("Proactive command pending (FETCH path)")
+    if body and body[0] in {0x62, 0x6F, 0xA5, 0xD0, 0xD1, 0xD3}:
+        tlv_decoded = decode_3gpp_tlvs(body)
+        if tlv_decoded:
+            notes.append("3GPP TLV: " + tlv_decoded)
+    return " | ".join(notes)
+
 def decode_apdu_response(resp: bytes) -> str:
     if len(resp) < 2:
         return "Malformed APDU response"
     sw1, sw2 = resp[-2], resp[-1]
-    parts = [decode_sw(sw1, sw2)]
     body = resp[:-2]
-    if body and body[0] in {0x62, 0x6F, 0xA5}:  # common FCP/FMD/AID templates
-        tlvs = _parse_tlvs(body[1:])
-        tag_map = {
-            0x80: "File size",
-            0x81: "Total file size",
-            0x82: "File descriptor",
-            0x83: "File Identifier",
-            0x84: "DF name / AID",
-            0x88: "Short file identifier",
-            0x8A: "Life cycle status",
-            0x8B: "Security attributes",
-        }
-        human = "; ".join(f"{tag_map.get(t, f'Tag {t:02X}')}: {to_hex(v)}" for t, v in tlvs[:8])
-        if human:
-            parts.append("TLV: " + human)
-    return " | ".join(parts)
+    return analyze_response(sw1, sw2, body)
 
 
 @dataclass(frozen=True)
@@ -358,11 +382,13 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
         tar_hex = to_hex(tar)
         tar_desc = tar_human_name(tar_hex)
         for ks in keyset_list:
+            probe_apdu = bytes.fromhex("00A40000023F00")
             resp = reader.test_tar(tar, ks)
-            hx = to_hex(resp)
+            resp_full = reader.maybe_get_response(probe_apdu, resp)
+            hx = to_hex(resp_full)
             if patt and not patt.search(hx):
                 continue
-            decoded = decode_apdu_response(resp)
+            decoded = " || ".join(decode_apdu_response(p) for p in resp_full.split(b"|"))
             if not tar_detected(resp):
                 # skip noisy non-detections
                 continue

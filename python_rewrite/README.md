@@ -61,3 +61,6 @@ For TAR scans you can test multiple well-known keysets in one run using `--keyse
 ```bash
 python3 -m python_rewrite.simtester_tools --allow-dummy tar --mode scanWellKnownTARs --keysets 1,3,5
 ```
+
+
+TAR positive responses now trigger GET RESPONSE follow-up (`61xx`/`9Fxx`) and decoded analysis of returned bytes using 3GPP-oriented TLV interpretation.
