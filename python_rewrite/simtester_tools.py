@@ -371,12 +371,20 @@ class ReaderBackend:
                 return b""
         return b""
 
+    def _log_exchange(self, apdu: bytes, resp: bytes, context: str = "apdu") -> None:
+        decoded = " || ".join(decode_apdu_response(part, context=context) for part in resp.split(b"|"))
+        print(f"[{self.name}] APDU {to_hex(apdu)} -> {to_hex(resp)} | {decoded}")
+
     def transmit(self, apdu: bytes) -> bytes:
         if self._conn:
             data, sw1, sw2 = self._conn.transmit(list(apdu))
-            return bytes(data + [sw1, sw2])
+            resp = bytes(data + [sw1, sw2])
+            self._log_exchange(apdu, resp, context="apdu")
+            return resp
         if self.allow_dummy:
-            return apdu[:2] + b"\x90\x00"
+            resp = apdu[:2] + b"\x90\x00"
+            self._log_exchange(apdu, resp, context="apdu")
+            return resp
         raise RuntimeError(f"No real reader connection for {self.name}")
 
 
@@ -390,7 +398,9 @@ class ReaderBackend:
             get_resp = bytes((cla, 0xC0, 0x00, 0x00, sw2))
             try:
                 extra = self.transmit(get_resp)
-                return resp + b"|" + extra
+                combined = resp + b"|" + extra
+                self._log_exchange(original_apdu, combined, context="apdu")
+                return combined
             except Exception:
                 return resp
         return resp
