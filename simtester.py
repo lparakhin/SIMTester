@@ -1346,6 +1346,8 @@ def analyze_ota_fuzz_results(results: Sequence[OTAFuzzResult]) -> list[str]:
     if warnings:
         labels = ", ".join(f"PID={r.pid:02X}/DCS={r.dcs:02X}/UDHI={int(r.udhi)}" for r in warnings)
         lines.append(f"WARNING-sensitive variants ({len(warnings)}): {labels}")
+    sensitivity: dict[str, int] = {}
+    controlled_groups: dict[str, int] = {}
     for field, label in (("pid", "PID"), ("dcs", "DCS"), ("udhi", "UDHI")):
         other_fields = [name for name in ("pid", "dcs", "udhi") if name != field]
         groups: dict[tuple[object, ...], list[OTAFuzzResult]] = {}
@@ -1353,11 +1355,46 @@ def analyze_ota_fuzz_results(results: Sequence[OTAFuzzResult]) -> list[str]:
             key = tuple(getattr(result, name) for name in other_fields)
             groups.setdefault(key, []).append(result)
         differences = 0
+        comparable = 0
         for group in groups.values():
-            if len({getattr(item, field) for item in group}) > 1 and len({item.response.sw for item in group}) > 1:
-                differences += 1
+            if len({getattr(item, field) for item in group}) > 1:
+                comparable += 1
+                if len({item.response.sw for item in group}) > 1:
+                    differences += 1
+        sensitivity[field] = differences
+        controlled_groups[field] = comparable
         if differences:
             lines.append(f"{label}-sensitive behavior: {differences} controlled comparison(s) changed SW.")
+        elif comparable:
+            lines.append(f"{label}-independent behavior: all {comparable} controlled comparison(s) kept the same SW.")
+    by_parameters = {(result.pid, result.dcs, result.udhi): result.response.sw for result in results}
+    ota_path_pairs = 0
+    seven_bit_pairs = 0
+    tested_pids = sorted({result.pid for result in results})
+    for pid in tested_pids:
+        if (by_parameters.get((pid, 0x00, False)) == 0x9000
+                and by_parameters.get((pid, 0x00, True)) == 0x9000):
+            seven_bit_pairs += 1
+        for dcs in (0x04, 0xF6):
+            if (by_parameters.get((pid, dcs, False)) == 0x9000
+                    and by_parameters.get((pid, dcs, True), 0) >> 8 == 0x62):
+                ota_path_pairs += 1
+    if ota_path_pairs:
+        lines.append(
+            f"DCS/UDHI interaction: {ota_path_pairs} pair(s) changed from empty 9000 with UDHI=0 "
+            "to 62xx with UDHI=1 for 8-bit/class-2 DCS 04/F6. This strongly suggests the "
+            "secured-packet UDH reaches a different UICC parser path."
+        )
+    if seven_bit_pairs:
+        lines.append(
+            f"DCS=00 control: all {seven_bit_pairs} PID pair(s) stayed at empty 9000 regardless of UDHI; "
+            "the 7-bit alphabet setting likely prevents equivalent binary OTA processing."
+        )
+    if controlled_groups.get("pid") and not sensitivity.get("pid"):
+        lines.append(
+            "PID conclusion: PID 00/40/7F did not affect any matched comparison; observed behavior is "
+            "driven by DCS/UDHI rather than PID within this test set."
+        )
     por_results = [result for result in results if result.por is not None]
     lines.append(f"PoR support: {len(por_results)}/{len(results)} variants returned a parseable response packet.")
     insecure = [result for result in por_results if result.por.status_code == 0]
@@ -1404,8 +1441,15 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
             except PacketError:
                 pass
             results.append(OTAFuzzResult(pid, dcs, udhi, response, parsed))
+            if response.sw == 0x9000 and not response.data:
+                ota_analysis = "ENVELOPE accepted only; empty 9000 is not PoR and does not prove OTA execution"
+            elif response.sw1 == 0x62:
+                ota_analysis = ("UICC returned a state-unchanged warning; retain as parser-path evidence, "
+                                "not as proof of command execution")
+            else:
+                ota_analysis = analysis.conclusion
             print(f"  RX={response.data.hex().upper() or '<empty>'} SW={response.sw:04X} "
-                  f"- {info.meaning}; ANALYSIS={analysis.conclusion}", flush=True)
+                  f"- {info.meaning}; ANALYSIS={ota_analysis}", flush=True)
     finally:
         print_sim_summary(transport, apdu_format)
         try:
@@ -1507,16 +1551,21 @@ def run_self_tests() -> int:
         assert "CC" in requested_msl(packets[5][1])
         assert "ciphering" in requested_msl(packets[13][1])
         matrix = [
-            OTAFuzzResult(0x7F, 0x00, False, APDUResponse(b"", 0x90, 0)),
-            OTAFuzzResult(0x7F, 0x00, True, APDUResponse(b"", 0x90, 0)),
-            OTAFuzzResult(0x7F, 0x04, False, APDUResponse(b"", 0x90, 0)),
-            OTAFuzzResult(0x7F, 0x04, True, APDUResponse(b"", 0x62, 0)),
-            OTAFuzzResult(0x7F, 0xF6, False, APDUResponse(b"", 0x90, 0)),
-            OTAFuzzResult(0x7F, 0xF6, True, APDUResponse(b"", 0x62, 0)),
+            OTAFuzzResult(
+                pid, dcs, udhi,
+                APDUResponse(b"", 0x62 if udhi and dcs in (0x04, 0xF6) else 0x90, 0),
+            )
+            for pid in (0x00, 0x40, 0x7F)
+            for dcs in (0x00, 0x04, 0xF6)
+            for udhi in (False, True)
         ]
         intelligence = analyze_ota_fuzz_results(matrix)
         assert any("UDHI-sensitive" in line for line in intelligence)
         assert any("DCS-sensitive" in line for line in intelligence)
+        assert any("PID-independent" in line for line in intelligence)
+        assert any("DCS/UDHI interaction: 6 pair(s)" in line for line in intelligence)
+        assert any("DCS=00 control: all 3 PID pair(s)" in line for line in intelligence)
+        assert any("PID conclusion" in line for line in intelligence)
         assert any("no PoR/data proves OTA execution" in line for line in intelligence)
         assert any("not an unprotected-TAR finding" in line for line in intelligence)
 

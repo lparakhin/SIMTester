@@ -22,6 +22,8 @@
 > ATR matches are restricted to telecom cards from recognized major SIM vendors.
 > `6881` triggers safe MANAGE CHANNEL probing across UICC logical channels 1-19.
 > OTA summaries correlate PID/DCS/UDHI differences and distinguish empty 9000 from PoR.
+> Repeated DCS/UDHI `9000`/`62xx` patterns are identified as parser-path evidence,
+> while PID-independent behavior is called out and never treated as OTA execution.
 
 SIMTester assess SIM card security in two dimensions:
 

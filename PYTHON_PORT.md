@@ -116,6 +116,11 @@ OTA fuzzing performs controlled PID/DCS/UDHI comparisons, identifies which
 parameter changes correlate with status-word changes, separates warning variants
 from the dominant response, measures parseable PoR support, and explicitly avoids
 treating an empty `9000` transport acknowledgement as proof of OTA execution.
+For the common 18-variant matrix, it also recognizes the repeated `9000` to
+`62xx` transition caused by combining UDHI with binary/class-2 DCS `04` or `F6`,
+uses DCS `00` as a control, and reports when PID `00`/`40`/`7F` is independent.
+This is classified as evidence that a different UICC parser path was reached,
+not as evidence that the secured command executed or that a TAR is unprotected.
 
 There is nothing to install and no second Python source file. Examples:
 
