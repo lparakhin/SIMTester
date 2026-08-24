@@ -102,6 +102,10 @@ EFTLab's Complete List of ATRs at
 second source; `SIMTESTER_EFTLAB_ATR_DATABASE` accepts an offline HTML copy.
 APDU findings now include contextual support confidence, severity, conclusions,
 and a recommended next step instead of relying on the status-word label alone.
+Both ATR sources are checked independently. Their raw matches are filtered to
+telecom indicators (SIM/UICC/USIM/eSIM, GSM/UMTS/LTE/3G/4G/5G, mobile/operator)
+and accepted only when attributed to a recognized major SIM manufacturer;
+payment cards, access badges, and unknown-vendor entries are excluded.
 
 There is nothing to install and no second Python source file. Examples:
 

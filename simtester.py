@@ -579,7 +579,13 @@ VENDOR_MARKERS = (
     (b"IDEMIA", "IDEMIA"), (b"MORPHO", "Morpho/IDEMIA"),
     (b"GIESECKE", "Giesecke+Devrient"), (b"G&D", "Giesecke+Devrient"),
     (b"WATCHDATA", "Watchdata"), (b"EASTCOM", "Eastcompeace"),
-    (b"VALID", "Valid"), (b"SYSMO", "sysmocom"),
+    (b"VALID", "Valid"), (b"KONA", "KONA I"),
+    (b"TIANYU", "Wuhan Tianyu"), (b"DATANG", "Datang"),
+)
+
+TELECOM_CARD_MARKERS = (
+    "SIM", "UICC", "USIM", "ISIM", "ESIM", "TELECOM", "MOBILE",
+    "GSM", "UMTS", "LTE", "3G", "4G", "5G", "OPERATOR", "TELEPHONY",
 )
 
 ATR_DATABASE_URL = "https://pcsc-tools.apdu.fr/smartcard_list.txt"
@@ -681,19 +687,32 @@ def lookup_atr_database(atr: bytes, database_text: str | None) -> list[str]:
     return matches
 
 
+def filter_major_sim_atr_matches(matches: Iterable[str]) -> list[tuple[str, str]]:
+    """Keep telecom-card entries attributable to a known major SIM vendor."""
+    filtered: list[tuple[str, str]] = []
+    for description in matches:
+        upper = description.upper()
+        if not any(marker in upper for marker in TELECOM_CARD_MARKERS):
+            continue
+        vendor = next((name for marker, name in VENDOR_MARKERS
+                       if marker.decode("ascii") in upper), None)
+        if vendor is not None and (vendor, description) not in filtered:
+            filtered.append((vendor, description))
+    return filtered
+
+
 def detect_sim_vendor(atr: bytes, manufacturer_area: bytes | None,
                       gemxpresso_file: bool = False,
                       atr_database_text: str | None = None) -> tuple[str, str]:
     """Conservative vendor match using public ATR text markers and vendor files."""
     evidence = atr.upper() + b" " + (manufacturer_area or b"").upper()
-    database_matches = lookup_atr_database(atr, atr_database_text)
+    database_matches = filter_major_sim_atr_matches(
+        lookup_atr_database(atr, atr_database_text)
+    )
     if database_matches:
-        description = " | ".join(database_matches[:3])
-        upper_description = description.upper().encode("ascii", "ignore")
-        for marker, vendor in VENDOR_MARKERS:
-            if marker in upper_description:
-                return vendor, f"public ATR database match: {description}"
-        return description, f"matched public ATR database ({ATR_DATABASE_URL} / {EFTLAB_ATR_URL})"
+        vendor = database_matches[0][0]
+        description = " | ".join(match[1] for match in database_matches[:3])
+        return vendor, f"major telecom-card ATR match: {description}"
     for marker, vendor in VENDOR_MARKERS:
         if marker in evidence:
             return vendor, f"matched marker {marker.decode('ascii')} in ATR/manufacturer data"
@@ -863,8 +882,18 @@ def collect_sim_summary(transport: CardTransport,
         summary["EFTLab ATR source"] = eftlab_source
         pcsc_matches = lookup_atr_database(atr_value, database_text)
         eftlab_matches = lookup_atr_database(atr_value, eftlab_text)
-        database_matches = pcsc_matches + [match for match in eftlab_matches if match not in pcsc_matches]
-        summary["ATR database match"] = " | ".join(database_matches[:3]) if database_matches else "none"
+        pcsc_telecom = filter_major_sim_atr_matches(pcsc_matches)
+        eftlab_telecom = filter_major_sim_atr_matches(eftlab_matches)
+        summary["pcsc-tools major SIM match"] = (
+            " | ".join(f"{vendor}: {description}" for vendor, description in pcsc_telecom[:3]) or "none"
+        )
+        summary["EFTLab major SIM match"] = (
+            " | ".join(f"{vendor}: {description}" for vendor, description in eftlab_telecom[:3]) or "none"
+        )
+        database_matches = pcsc_telecom + [match for match in eftlab_telecom if match not in pcsc_telecom]
+        summary["ATR database match"] = (
+            " | ".join(f"{vendor}: {description}" for vendor, description in database_matches[:3]) or "none"
+        )
         combined_database = "\n".join(part for part in (database_text, eftlab_text) if part)
         vendor, evidence = detect_sim_vendor(
             atr_value, manufacturer, gemxpresso, combined_database
@@ -1470,6 +1499,12 @@ def run_self_tests() -> int:
             "<table><tr><td>3B 10 94</td><td>Thales demo UICC</td></tr></table>"
         )
         assert lookup_atr_database(bytes.fromhex("3B1094"), eftlab) == ["Thales demo UICC"]
+        filtered = filter_major_sim_atr_matches((
+            "Gemalto banking card", "Unknown operator UICC", "Thales 5G UICC",
+            "Giesecke+Devrient USIM", "random access badge",
+        ))
+        assert filtered == [("Thales", "Thales 5G UICC"),
+                            ("Giesecke+Devrient", "Giesecke+Devrient USIM")]
 
     @check("PIN2 and PUK2 fall back from UICC to classic references")
     def _credential_fallback() -> None:
