@@ -390,6 +390,103 @@ class PCSCTransport:
     def close(self) -> None:
         self.connection.disconnect()
 
+    def atr(self) -> bytes:
+        return bytes(self.connection.getATR())
+
+
+def _decode_bcd(data: bytes) -> str:
+    digits = "".join(f"{byte & 15:X}{byte >> 4:X}" for byte in data)
+    return digits.rstrip("F")
+
+
+def _card_command(transport: CardTransport, command: bytes) -> APDUResponse:
+    """Transmit a summary APDU and handle 61xx and 6Cxx responses."""
+    response = transport.transmit(command)
+    if response.sw1 == 0x6C:
+        response = transport.transmit(command[:-1] + bytes((response.sw2,)))
+    data = response.data
+    while response.sw1 in (0x61, 0x9F):
+        response = transport.transmit(bytes((command[0], 0xC0, 0, 0, response.sw2)))
+        data += response.data
+    return APDUResponse(data, response.sw1, response.sw2)
+
+
+def _read_transparent_file(transport: CardTransport, path: Sequence[int]) -> bytes | None:
+    for cla in (0x00, 0xA0):
+        selected = True
+        for fid in path:
+            response = _card_command(
+                transport, bytes((cla, 0xA4, 0x00, 0x04 if cla == 0 else 0x00, 0x02))
+                + fid.to_bytes(2, "big")
+            )
+            if response.sw != 0x9000:
+                selected = False
+                break
+        if selected:
+            response = _card_command(transport, bytes((cla, 0xB0, 0, 0, 0)))
+            if response.sw == 0x9000:
+                return response.data
+    return None
+
+
+def _read_first_record(transport: CardTransport, path: Sequence[int]) -> bytes | None:
+    for cla in (0x00, 0xA0):
+        selected = True
+        for fid in path:
+            response = _card_command(
+                transport, bytes((cla, 0xA4, 0x00, 0x04 if cla == 0 else 0x00, 0x02))
+                + fid.to_bytes(2, "big")
+            )
+            if response.sw != 0x9000:
+                selected = False
+                break
+        if selected:
+            response = _card_command(transport, bytes((cla, 0xB2, 1, 4, 0)))
+            if response.sw == 0x9000:
+                return response.data
+    return None
+
+
+def collect_sim_summary(transport: CardTransport) -> dict[str, str]:
+    """Best-effort read of common subscriber identity files."""
+    summary = {"ATR": "unavailable", "ICCID": "unavailable", "IMSI": "unavailable",
+               "MSISDN": "unavailable", "SPN": "unavailable"}
+    atr = getattr(transport, "atr", None)
+    if atr is not None:
+        try:
+            summary["ATR"] = atr().hex().upper()
+        except Exception:
+            pass
+    try:
+        iccid = _read_transparent_file(transport, (0x3F00, 0x2FE2))
+        if iccid:
+            summary["ICCID"] = _decode_bcd(iccid)
+        imsi = _read_transparent_file(transport, (0x3F00, 0x7F20, 0x6F07))
+        if imsi and len(imsi) > 1:
+            length = min(imsi[0], len(imsi) - 1)
+            body = imsi[1:1 + length]
+            summary["IMSI"] = (f"{body[0] >> 4:X}" + _decode_bcd(body[1:])).rstrip("F")
+        spn = _read_transparent_file(transport, (0x3F00, 0x7F20, 0x6F46))
+        if spn and len(spn) > 1:
+            summary["SPN"] = spn[1:].rstrip(b"\xFF\0").decode("ascii", "replace").strip() or "unavailable"
+        msisdn = _read_first_record(transport, (0x3F00, 0x7F10, 0x6F40))
+        if msisdn and len(msisdn) >= 14:
+            footer = msisdn[-14:]
+            number_length = footer[0]
+            if 1 < number_length <= 11:
+                number = _decode_bcd(footer[2:2 + number_length - 1])
+                summary["MSISDN"] = ("+" if footer[1] & 0x70 == 0x10 else "") + number
+    except Exception as exc:
+        summary["Read status"] = f"partial ({exc})"
+    return summary
+
+
+def print_sim_summary(transport: CardTransport) -> None:
+    print("\n========== SIM CARD SUMMARY ==========", flush=True)
+    for name, value in collect_sim_summary(transport).items():
+        print(f"{name}: {value}", flush=True)
+    print("======================================", flush=True)
+
 
 @dataclass(frozen=True)
 class ScanFinding:
@@ -578,6 +675,7 @@ def _run_scan(reader: int, level2: bool) -> None:
         aborted = True
         print(f"SCAN ABORTED: {exc}", flush=True)
     finally:
+        print_sim_summary(transport)
         try:
             transport.close()
         except Exception as exc:
@@ -671,6 +769,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
                   f"- {info.meaning}", flush=True)
             results.append((group, tar, response, parsed))
     finally:
+        print_sim_summary(transport)
         try:
             transport.close()
         except Exception:
@@ -717,6 +816,7 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
             print(f"  RX={response.data.hex().upper() or '<empty>'} SW={response.sw:04X} "
                   f"- {info.meaning}", flush=True)
     finally:
+        print_sim_summary(transport)
         try:
             transport.close()
         except Exception:
@@ -853,6 +953,33 @@ def run_self_tests() -> int:
         answers = iter(("x", "9", "1"))
         selected = _select_reader(("Reader A", "Reader B"), lambda _prompt: next(answers))
         assert selected == 1
+
+    @check("SIM summary decodes ICCID, IMSI, MSISDN and SPN")
+    def _sim_summary() -> None:
+        class SummaryCard:
+            selected = 0
+
+            def atr(self) -> bytes:
+                return bytes.fromhex("3B00")
+
+            def transmit(self, apdu: bytes) -> APDUResponse:
+                if apdu[1] == 0xA4:
+                    self.selected = int.from_bytes(apdu[-2:], "big")
+                    return APDUResponse(b"", 0x90, 0)
+                files = {
+                    0x2FE2: bytes.fromhex("981032547698103254F6"),
+                    0x6F07: bytes.fromhex("082943658709214365"),
+                    0x6F46: b"\x00Carrier\xFF",
+                    0x6F40: bytes.fromhex("06912143658709FFFFFFFFFFFFFF"),
+                }
+                return APDUResponse(files.get(self.selected, b""), 0x90, 0)
+
+        summary = collect_sim_summary(SummaryCard())
+        assert summary["ATR"] == "3B00"
+        assert summary["ICCID"] == "8901234567890123456"
+        assert summary["IMSI"] == "234567890123456"
+        assert summary["MSISDN"] == "+1234567890"
+        assert summary["SPN"] == "Carrier"
 
     failures = 0
     for name, function in checks:

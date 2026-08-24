@@ -73,6 +73,9 @@ Reader discovery and card connection failures are reported as short actionable
 errors (for example, asking the user to insert the card) rather than tracebacks.
 Before every interactive workflow, the tool lists all discovered PC/SC readers
 by name and validates the selected reader index.
+After every scan, a best-effort SIM card summary reads and decodes ATR, ICCID,
+IMSI, MSISDN, and service-provider name. Both UICC (`00`) and classic SIM (`A0`)
+APDU classes are attempted; protected or absent fields are shown as unavailable.
 
 There is nothing to install and no second Python source file. Examples:
 

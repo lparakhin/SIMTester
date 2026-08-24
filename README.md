@@ -12,6 +12,7 @@
 > The interactive menu is limited to four workflows: standard fuzzing, TAR scanning,
 > APDU scanning, and OTA fuzzing.
 > Each workflow displays a named SIM-reader selection menu before connecting.
+> Every scan ends with a best-effort ATR, ICCID, IMSI, MSISDN, and SPN summary.
 
 SIMTester assess SIM card security in two dimensions:
 
