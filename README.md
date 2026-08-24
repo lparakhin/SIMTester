@@ -20,15 +20,52 @@
 > ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
 > EFTLab's ATR list is a second source, and SW analysis adds severity and next-step guidance.
 > ATR matches are restricted to telecom cards from recognized major SIM vendors.
-> `6881` triggers safe MANAGE CHANNEL probing across UICC logical channels 1-19.
+> `6881` is filtered as a rejected channel-coded CLA, not evidence that the INS exists.
+> Optional `scan-apdu --logical-channels` expansion uses temporary MANAGE CHANNEL probes.
 > OTA summaries correlate PID/DCS/UDHI differences and distinguish empty 9000 from PoR.
 > Repeated DCS/UDHI `9000`/`62xx` patterns are identified as parser-path evidence,
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; dual-answer scans identify build `uicc-short-long-v4`.
+> Use `python simtester.py --version`; current scans identify build `apdu-scan-findings-v17`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
-> Every STATUS/GET DATA result includes both a one-line SHORT and field-level LONG answer.
+> Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
+> field-level decode with the raw response retained for auditing. UICC GET DATA
+> tries ISO interindustry `00 CA 00 66 00` and the detected telecom CLA
+> (`80` for UICC or `A0` for classic SIM), then decodes card-recognition template `66`.
+> When object `0066` is unavailable, output lists each full APDU, SW, and decoded
+> reason without repeating empty raw data or presenting the optional probe as an error.
+> Dual failures are collapsed to one optional/unavailable header, one compact
+> ISO/telecom status line, and expanded per-command evidence plus scope.
+> STATUS also logs every initial/corrected APDU. Successful FCP responses include
+> descriptor/data-coding, lifecycle, memory, compact-security, and PIN details;
+> failed STATUS responses include a decoded SW, interpretation, and scope.
+> APDU scans do not open channels by default. They summarize primary status-word
+> distributions, explain `6881`/`6E00`/`6D00`, and list actionable findings with
+> the exact APDU. Opt-in channel expansion normalizes CLA channel bits, runs
+> MANAGE CHANNEL once per class family, and labels open/probe/close exchanges.
+> Quick scans default to popular TARs `000000`, `000001`, `505348`, `534054`,
+> `B00001`, and `B00010` across commonly used keysets 1-6. Standard fuzzing
+> also checks submit-mode clear and ciphered PoR requests with MSL=0 commands.
+> Every generated SMS-PP command is structurally checked as a short ENVELOPE
+> APDU, SMS-PP DOWNLOAD `D1` template, SMS-DELIVER TPDU, and secured command
+> packet before transmission. Summaries correlate responses across profiles and
+> keysets and never treat an empty submit-mode `9000` as proof of OTA execution.
+> TAR scans test every response-capable security profile by default and classify
+> each TAR as EXISTS ON CARD, NOT FOUND ON TESTED ROUTE, or UNDETERMINED. Confirmation
+> requires a structurally valid PoR whose returned TAR matches the probe.
+> Standard and all-MSL TAR scans also send the explicit unsecured SPI1 matrix:
+> `00,01,02,04,05,06,08,09,0A,0C,0D,0E,10,11,14,15,18,19,1C,1D`.
+> CC bytes are zero-filled and declared ciphering is not applied, so these are
+> clearly labeled detection probes rather than genuinely secured commands.
+> PoR requests are encoded and logged from SPI2 per 3GPP TS 31.115 / ETSI
+> TS 102 225: request policy (`00`, `01`, or `10`), RC/CC/DS protection,
+> ciphering, and SMS-DELIVER-REPORT versus SMS-SUBMIT response mode. Reserved
+> request/RFU combinations are rejected, and SMS-SUBMIT is never counted as an
+> ENVELOPE-response PoR. GSMA UICC/eSIM deployments reuse these OTA mechanisms.
+> Use `python simtester.py check-tar B00010 505348 --reader 0` for a focused
+> existence check. The final `EXISTS=YES|NO|UNKNOWN` answer includes its PoR
+> evidence and tested-route limitation.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:

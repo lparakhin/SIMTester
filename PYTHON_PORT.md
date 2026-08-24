@@ -68,6 +68,37 @@ Running `python simtester.py` now shows only the four primary test workflows:
 3. APDU scanning at level 1 or level 2.
 4. OTA fuzzing of PID, DCS, and UDHI values (common values or brute force).
 
+Standard fuzzing adds two explicitly labeled unprotected submit-mode PoR probes
+to the original matrix. Quick known-TAR scans use the common RAM/WIB/S@T/RFM
+values `000000`, `000001`, `505348`, `534054`, `B00001`, and `B00010` across
+keysets 1 through 6 by default; full-corpus and custom keyset scans remain
+available.
+Standard fuzzing preserves each profile's SPI2 exactly; unlike conclusive TAR
+scans, it does not force PoR onto the original no-PoR control. Before sending,
+the tool validates ENVELOPE CLA/INS/P1/P2/Lc, the `D1` TLV hierarchy,
+network-to-UICC identities, SMS-DELIVER PID/DCS/UDL, and secured-packet lengths.
+Response correlation distinguishes repeated parser warnings and empty
+submit-mode acknowledgements from parseable PoR evidence.
+Known and ranged TAR scans now expand each TAR/keyset over the 16 original
+response-capable profiles plus 20 explicit unsecured SPI1/MSL values:
+`00, 01, 02, 04, 05, 06, 08, 09, 0A, 0C, 0D, 0E, 10, 11, 14, 15, 18, 19, 1C, 1D`.
+The matrix covers counter, checksum, ciphering, and RFU-bit declarations, but
+does not apply real ciphering and uses zero-filled checksum bytes. A TAR is confirmed only when a parseable
+PoR returns the same TAR with an RSC other than `09`; matching RSC `09` is shown
+as `NOT FOUND ON TESTED ROUTE`, and transport-only status words remain `UNDETERMINED`.
+The menu and `scan-known-tars --single-profile` retain a fast basic-profile mode.
+PoR SPI2 is validated independently of command MSL: bits 1-0 select no PoR,
+always PoR, or error-only PoR; bits 3-2 select no security/RC/CC/DS; bit 4
+selects PoR ciphering; and bit 5 selects SMS-DELIVER-REPORT or SMS-SUBMIT.
+The live log prints this full decode for every probe. Reserved request value
+`11`, RFU bits, contradictory no-PoR options, and attempts to treat an
+SMS-SUBMIT PoR as an ENVELOPE response are rejected.
+For a direct answer, `check-tar` accepts one or more arbitrary three-byte TARs,
+tests them across selected keysets and all response-capable MSL profiles, and
+prints `EXISTS=YES`, `NO`, or `UNKNOWN`. `YES` requires a matching non-`09` PoR;
+`NO` means the tested route explicitly returned unknown-TAR RSC `09`; `UNKNOWN`
+means the card returned no matching PoR, so absence cannot be inferred.
+
 Lower-level packet and automation commands remain available as CLI subcommands.
 Reader discovery and card connection failures are reported as short actionable
 errors (for example, asking the user to insert the card) rather than tracebacks.
@@ -112,10 +143,14 @@ The pcsc-tools text and normalized EFTLab HTML are now assembled into one
 in-process ATR lookup index, with both source locations retained in
 the summary. Local snapshots can still be selected through the environment
 variables for fully offline and reproducible matching.
-When a probe returns `6881`, the scanner uses MANAGE CHANNEL to open every
-logical channel offered by the UICC (channels 1 through 19), applies ISO/IEC
-7816-4/ETSI channel CLA encoding, retries the APDU on each channel, records the
-channel in findings, and closes every channel afterward.
+When a probe returns `6881`, the default scanner records it as a rejected
+channel-coded CLA and does not infer INS support or alter card-wide channel
+state. The optional `scan-apdu --logical-channels` mode normalizes CLA channel
+bits and uses MANAGE CHANNEL once for that class family to open the logical
+channels offered by the UICC (channels 1 through 19). It applies ISO/IEC
+7816-4/ETSI channel CLA encoding, retries the APDU, records supported-channel
+findings, and closes every temporary channel. Raw CLA bytes such as `F4` through
+`F7` therefore do not reopen and retest the same card-wide channels four times.
 OTA fuzzing performs controlled PID/DCS/UDHI comparisons, identifies which
 parameter changes correlate with status-word changes, separates warning variants
 from the dominant response, measures parseable PoR support, and explicitly avoids
@@ -127,7 +162,8 @@ This is classified as evidence that a different UICC parser path was reached,
 not as evidence that the secured command executed or that a TAR is unprotected.
 Every TAR probe now requests PoR, including caller-supplied packets that omitted
 the request bit. Before delivery, the TAR workflow sends the generation-specific
-ETSI UICC/SIM STATUS command and an optional ISO GET DATA card-recognition probe,
+ETSI UICC/SIM STATUS command and optional card-recognition GET DATA probes using
+both ISO CLA `00` and the detected UICC/SIM telecom CLA (`80`/`A0`),
 follows `61xx`, `9Fxx`, and `6Cxx`, and logs every initial and corrected exchange.
 `6D00` from optional GET DATA is reported as a context capability result rather
 than evidence against OTA support. Repeated empty `62xx` replies are collapsed
@@ -135,14 +171,17 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the dual-answer build reports `uicc-short-long-v4`.
+being executed, and the current build reports `apdu-scan-findings-v17`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as
-raw hexadecimal instead of being guessed. Optional GET DATA `6D00` explicitly
-states that INS `CA` is absent for that CLA and is unrelated to TAR/PoR results.
-Each context result now prints both `SHORT`, a one-line operational answer, and
-`LONG`, the complete field-by-field decode. This keeps full ETSI/3GPP evidence
+raw hexadecimal instead of being guessed. Output provides COMPACT and EXPANDED
+views, and successful GET DATA card-recognition responses decode template `66`
+and its known fields while retaining unknown tags. A `6D00` or `6E00` response
+is reported together with every CLA attempted; it means that specific format is
+unsupported and remains unrelated to TAR/PoR results.
+Each context result now prints both `COMPACT`, a one-line operational answer, and
+`EXPANDED`, the raw response plus complete field-by-field decode. This keeps full ETSI/3GPP evidence
 available without forcing operators to read every TLV during a large TAR scan.
 
 There is nothing to install and no second Python source file. Examples:

@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.3"
-BUILD_ID = "uicc-short-long-v4"
+__version__ = "0.4.6"
+BUILD_ID = "apdu-scan-findings-v17"
 
 
 class PacketError(ValueError):
@@ -43,6 +43,8 @@ class CommandPacket:
     fake_kid: int | None = None
     cryptographic_checksum: bool = False
     ciphering: bool = False
+    por_security: int = 0
+    por_on_error_only: bool = False
 
     HEADER = b"\x02\x70\x00"
 
@@ -55,6 +57,17 @@ class CommandPacket:
             raise PacketError("counter must fit in five bytes")
         if not 0 <= self.counter_management <= 3:
             raise PacketError("counter management must be between 0 and 3")
+        if not 0 <= self.por_security <= 3:
+            raise PacketError("PoR security must be 0 (none), 1 (RC), 2 (CC), or 3 (DS)")
+        for name, value in (("fake SPI1", self.fake_spi1), ("fake SPI2", self.fake_spi2),
+                            ("fake KIC", self.fake_kic), ("fake KID", self.fake_kid)):
+            if value is not None and not 0 <= value <= 0xFF:
+                raise PacketError(f"{name} must fit in one byte")
+        if self.fake_spi2 is None:
+            if self.por_on_error_only and not self.request_por:
+                raise PacketError("error-only PoR requires request_por=True")
+            if not self.request_por and (self.cipher_por or self.por_mode_submit or self.por_security):
+                raise PacketError("PoR security, ciphering, and mode require a PoR request")
 
     @staticmethod
     def _algorithm_nibble(algorithm: int, *, kic: bool) -> int:
@@ -73,7 +86,8 @@ class CommandPacket:
 
     @property
     def spi2(self) -> int:
-        return ((1 if self.request_por else 0) | (0x10 if self.cipher_por else 0)
+        request = 2 if self.por_on_error_only else (1 if self.request_por else 0)
+        return (request | (self.por_security << 2) | (0x10 if self.cipher_por else 0)
                 | (0x20 if self.por_mode_submit else 0))
 
     @property
@@ -104,6 +118,10 @@ class CommandPacket:
         if data[5] not in (13, 21):
             raise PacketError("command header length must be 13 or 21")
         spi1, spi2, kic, kid = data[6:10]
+        if spi2 & 0xC0 or (spi2 & 3) == 3:
+            raise PacketError("SPI2 contains reserved PoR/RFU coding")
+        if (spi2 & 3) == 0 and spi2 & 0x3C:
+            raise PacketError("SPI2 sets PoR options while PoR is not requested")
         reverse = {0: 0, 1: 1, 5: 2, 9: 3, 13: 4}
         if kic >> 4 != kid >> 4:
             raise PacketError("KIC and KID keysets differ")
@@ -113,9 +131,10 @@ class CommandPacket:
         user_offset = 27 if checksum_present else 19
         return cls(data[10:13], kic >> 4, int.from_bytes(data[13:18], "big"), data[user_offset:],
                    (spi1 >> 3) & 3, reverse[kic & 15], reverse[kid & 15],
-                   (spi2 & 3) == 1, bool(spi2 & 0x10), bool(spi2 & 0x20),
+                   (spi2 & 3) in (1, 2), bool(spi2 & 0x10), bool(spi2 & 0x20),
                    cryptographic_checksum=checksum_present or bool(spi1 & 2),
-                   ciphering=bool(spi1 & 4))
+                   ciphering=bool(spi1 & 4), por_security=(spi2 >> 2) & 3,
+                   por_on_error_only=(spi2 & 3) == 2)
 
 
 # Curated probe corpus retained from SIMTester. "RFM" contains common remote
@@ -128,6 +147,16 @@ KNOWN_TAR_GROUPS: dict[str, tuple[str, ...]] = {
     "RFM": tuple("00000A 00000B 00000C 00000D 00004F 000057 000070 000076 000080 000092\n0000B6 0000E2 000203 000304 000503 010001 010101 010203 012345 012347\n060504 100000 111212 212223 260500 313131 385300 3F0000 3F0001 3F0002\n3F0010 3F0011 41444E 414C4F 415256 415345 424950 425058 434354 443231\n474341 47534D 484353 49434D 494D45 4C5041 4D4552 4D4C4D 4E4147 4E5550\n4E5553 4E5650 4F4350 504F53 514F43 524144 524648 524A49 54454C 524F4D\n533347 534143 534441 534F44 53534D 535353 564153 64646D 800001 800002\n800040 800041 B00000 B00001 B00002 B00003 B0000F B00010 B00011 B00012\nB00013 B00020 B00021 B00030 B00040 B00041 B00042 B00050 B000F1 B00120\nB00140 B00141 B00142 B00143 B00144 B00145 B11000 B20100 B20102 BAFE02\nC00000 C0013D C001AA C001AB C001AD D00003 EED200 EED201 EEE200 EEE201\nFFFF01 FFFFFF".split()),  # RFM/vendor applet candidates
 }
 
+# High-value defaults used by the original SIMTester "poke" workflow plus the
+# two standardized browser TARs.  They are tried first when an operator wants a
+# quick scan; the complete corpus remains available for exhaustive scans.
+POPULAR_TARS = ("000000", "000001", "505348", "534054", "B00001", "B00010")
+POPULAR_KEYSETS = (1, 2, 3, 4, 5, 6)
+UNSECURED_MSL_VALUES = (
+    0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0C,
+    0x0D, 0x0E, 0x10, 0x11, 0x14, 0x15, 0x18, 0x19, 0x1C, 0x1D,
+)
+
 
 def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> Iterator[tuple[str, CommandPacket]]:
     """Yield labeled OTA packets for the curated S@T, WIB, RAM and vendor corpus."""
@@ -137,6 +166,30 @@ def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> I
             raise ValueError(f"unknown TAR group {group}; choose RAM, WIB, SAT or RFM")
         for value in KNOWN_TAR_GROUPS[group]:
             yield group, CommandPacket(bytes.fromhex(value), keyset=keyset, user_data=b"\0" * 5)
+
+
+def known_tar_keyset_packets(keysets: Iterable[int], groups: Iterable[str] | None = None,
+                             *, popular_only: bool = False) -> Iterator[tuple[str, CommandPacket]]:
+    """Yield known or popular TAR probes across multiple OTA keysets."""
+    wanted = set(POPULAR_TARS) if popular_only else None
+    for keyset in keysets:
+        for group, packet in known_tar_packets(keyset, groups):
+            if wanted is None or packet.tar.hex().upper() in wanted:
+                yield f"{group}/K{keyset}", packet
+
+
+def targeted_tar_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Yield operator-supplied TAR candidates across selected keysets."""
+    normalized = tuple(value.strip().upper() for value in tars)
+    for value in normalized:
+        try:
+            tar = bytes.fromhex(value)
+        except ValueError as exc:
+            raise PacketError(f"invalid TAR hexadecimal value {value!r}") from exc
+        if len(tar) != 3:
+            raise PacketError(f"TAR {value!r} must be exactly three bytes")
+        for keyset in keysets:
+            yield f"TARGET/K{keyset}", CommandPacket(tar, keyset=keyset, user_data=b"\0" * 5)
 
 
 def _tlv(tag: int, value: bytes) -> bytes:
@@ -167,6 +220,61 @@ def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True,
     return bytes((0x80 if third_gen else 0xA0, 0xC2, 0x00, 0x00, len(envelope))) + envelope
 
 
+def validate_sms_pp_download_apdu(apdu: bytes, packet: CommandPacket, *,
+                                  third_gen: bool = True, pid: int = 0x7F,
+                                  dcs: int = 0xF6, udhi: bool = True) -> tuple[str, ...]:
+    """Validate the generated 3GPP/ETSI SMS-PP DOWNLOAD command hierarchy.
+
+    This checks the short ENVELOPE APDU, BER-TLV lengths, terminal-to-UICC
+    device identities, SMS-TPDU layout, and embedded secured command packet.
+    It intentionally validates structure rather than claiming card acceptance.
+    """
+    expected_cla = 0x80 if third_gen else 0xA0
+    expected_tags = (0x82, 0x86, 0x8B) if third_gen else (0x02, 0x06, 0x0B)
+    if len(apdu) < 7 or apdu[:4] != bytes((expected_cla, 0xC2, 0, 0)):
+        raise PacketError("ENVELOPE must use the detected CLA, INS C2 and P1/P2=0000")
+    if apdu[4] != len(apdu) - 5:
+        raise PacketError("ENVELOPE short-APDU Lc does not match its data length")
+    if apdu[5] != 0xD1 or apdu[6] != len(apdu) - 7:
+        raise PacketError("SMS-PP DOWNLOAD template D1 length is inconsistent")
+    body = apdu[7:]
+    if body[:4] != bytes((expected_tags[0], 0x02, 0x83, 0x81)):
+        raise PacketError("device identities must encode network-to-UICC (83 to 81)")
+    offset = 4
+    if len(body) < offset + 2 or body[offset] != expected_tags[1]:
+        raise PacketError("SMS-PP address TLV is missing or uses the wrong comprehension tag")
+    address_length = body[offset + 1]
+    offset += 2 + address_length
+    if address_length < 2 or len(body) < offset + 2 or body[offset] != expected_tags[2]:
+        raise PacketError("SMS TPDU TLV is missing or the address value is malformed")
+    tpdu_length = body[offset + 1]
+    tpdu = body[offset + 2:]
+    if tpdu_length != len(tpdu) or len(tpdu) < 13:
+        raise PacketError("SMS-DELIVER TPDU length is inconsistent")
+    first_octet = tpdu[0]
+    if first_octet & 0x03:
+        raise PacketError("TP-MTI must encode SMS-DELIVER")
+    if bool(first_octet & 0x40) != udhi:
+        raise PacketError("TP-UDHI does not match the requested OTA transport mode")
+    oa_octets = (tpdu[1] + 1) // 2
+    pid_offset = 3 + oa_octets
+    if len(tpdu) < pid_offset + 10 or tpdu[pid_offset:pid_offset + 2] != bytes((pid, dcs)):
+        raise PacketError("TP-OA, TP-PID or TP-DCS is inconsistent")
+    udl_offset = pid_offset + 9
+    user_data = tpdu[udl_offset + 1:]
+    if tpdu[udl_offset] != len(user_data):
+        raise PacketError("TP-UDL does not match the octet-aligned TP-UD length")
+    if user_data != packet.to_bytes():
+        raise PacketError("TP-UD does not contain the expected secured command packet")
+    CommandPacket.parse(user_data)
+    return (
+        f"short APDU case 3: CLA={expected_cla:02X}, INS=C2, Lc={apdu[4]}",
+        f"SMS-PP DOWNLOAD D1: device identities network-to-UICC, TPDU={tpdu_length} byte(s)",
+        f"SMS-DELIVER: UDHI={'set' if udhi else 'clear'}, PID={pid:02X}, DCS={dcs:02X}, UDL={len(user_data)}",
+        "secured packet: UDH/CPH=027000, CPL/CHL and payload lengths valid",
+    )
+
+
 FUZZER_PROFILES = (
     (0, 0, 0, False, False), (0, 0, 0, True, False),
     (1, 0, 0, True, False), (2, 0, 0, True, False),
@@ -179,12 +287,41 @@ FUZZER_PROFILES = (
     (3, 3, 3, True, True),
 )
 
+# Additional MSL=0 probes vary only the PoR delivery mode.  They do not add a
+# counter, checksum, or ciphering to the command and are therefore safe to
+# classify as unprotected even when the requested response itself is ciphered.
+UNSECURED_POR_PROFILES = (
+    ("U-SUBMIT", False, True),
+    ("U-SUBMIT-CIPHER-POR", True, True),
+)
 
-def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
-    """Generate the original 17 standard fuzzing mechanisms."""
+
+def unsecured_msl_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Generate the requested raw SPI1/MSL probes without real command security.
+
+    Checksum fields are zero-filled and ciphering is declared but not applied;
+    these are detection probes, never authenticated production commands.
+    """
     for tar in tars:
         tar_bytes = bytes.fromhex(tar)
         for keyset in keysets:
+            for msl in UNSECURED_MSL_VALUES:
+                yield f"MSL={msl:02X}/K{keyset}", CommandPacket(
+                    tar_bytes, keyset, user_data=b"\0" * 5,
+                    counter_management=(msl >> 3) & 3,
+                    request_por=True, fake_spi1=msl,
+                    cryptographic_checksum=bool(msl & 0x02),
+                    ciphering=bool(msl & 0x04),
+                )
+
+
+def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Generate the original 17 mechanisms plus explicit MSL=0 PoR modes."""
+    tar_list = tuple(tars)
+    keyset_list = tuple(keysets)
+    for tar in tar_list:
+        tar_bytes = bytes.fromhex(tar)
+        for keyset in keyset_list:
             for index, (counter, kic, kid, por, cipher_por) in enumerate(FUZZER_PROFILES):
                 yield f"F{index:02d}/K{keyset}", CommandPacket(
                     tar_bytes, keyset, counter=0 if counter == 0 else 1, user_data=b"\0" * 5,
@@ -192,6 +329,29 @@ def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iter
                     kid_algorithm=kid, request_por=por, cipher_por=cipher_por,
                     cryptographic_checksum=kid != 0, ciphering=kic != 0,
                 )
+            for label, cipher_por, submit in UNSECURED_POR_PROFILES:
+                yield f"{label}/K{keyset}", CommandPacket(
+                    tar_bytes, keyset, user_data=b"\0" * 5, request_por=True,
+                    cipher_por=cipher_por, por_mode_submit=submit,
+                )
+    yield from unsecured_msl_packets(tar_list, keyset_list)
+
+
+def tar_msl_probe_packets(
+    probes: Iterable[tuple[str, CommandPacket]],
+) -> Iterator[tuple[str, CommandPacket]]:
+    """Expand TAR candidates over response-capable MSL/security profiles.
+
+    F00 is omitted because it requests no PoR. Submit-mode probes are omitted
+    because their PoR leaves the UICC as an SMS-SUBMIT rather than being
+    available in the ENVELOPE response used for TAR confirmation.
+    """
+    for group, base in probes:
+        tar = base.tar.hex().upper()
+        base_group = group.rsplit("/K", 1)[0]
+        for label, packet in standard_fuzzer_packets((tar,), (base.keyset,)):
+            if packet.request_por and not packet.por_mode_submit:
+                yield f"{base_group}/{label}", packet
 
 
 @dataclass(frozen=True)
@@ -253,6 +413,19 @@ class ResponsePacket:
 
 
 def requested_msl(packet: CommandPacket) -> str:
+    if packet.fake_spi1 is not None:
+        attributes = []
+        if packet.fake_spi1 & 0x01:
+            attributes.append("RFU-bit-set")
+        if packet.fake_spi1 & 0x02:
+            attributes.append("zero-filled-CC")
+        if packet.fake_spi1 & 0x04:
+            attributes.append("ciphering-declared-not-applied")
+        counter = (packet.fake_spi1 >> 3) & 3
+        if counter:
+            attributes.append(f"counter-mode-{counter}")
+        detail = ", ".join(attributes) or "no command security"
+        return f"MSL={packet.fake_spi1:02X} (unsecured SPI1 probe: {detail})"
     protections = []
     if packet.cryptographic_checksum:
         protections.append("CC")
@@ -261,6 +434,47 @@ def requested_msl(packet: CommandPacket) -> str:
     if packet.counter_management:
         protections.append(f"counter-mode-{packet.counter_management}")
     return "MSL=0 (no command security)" if not protections else "MSL>0 (" + ", ".join(protections) + ")"
+
+
+def is_unsecured_probe(packet: CommandPacket) -> bool:
+    """Return whether this command deliberately lacks applied command security."""
+    return packet.fake_spi1 is not None or requested_msl(packet).startswith("MSL=0")
+
+
+def describe_por_request(packet: CommandPacket) -> str:
+    """Decode the effective TS 31.115/TS 102 225 SPI2 PoR request."""
+    spi2 = packet.spi2 if packet.fake_spi2 is None else packet.fake_spi2
+    request_code = spi2 & 0x03
+    request = {0: "not requested", 1: "requested-always", 2: "requested-on-error",
+               3: "reserved/invalid"}[request_code]
+    security = {0: "none", 1: "RC", 2: "CC", 3: "DS"}[(spi2 >> 2) & 3]
+    mode = "SMS-SUBMIT" if spi2 & 0x20 else "SMS-DELIVER-REPORT"
+    ciphering = "ciphered" if spi2 & 0x10 else "clear"
+    rfu = spi2 & 0xC0
+    suffix = f", RFU={rfu:02X}" if rfu else ""
+    return (f"SPI2={spi2:02X}: PoR {request}, security={security}, "
+            f"response={mode}/{ciphering}{suffix}")
+
+
+def validate_por_request(packet: CommandPacket, *, envelope_response_required: bool = False) -> tuple[str, ...]:
+    """Validate PoR coding and whether the selected bearer can return it here."""
+    spi2 = packet.spi2 if packet.fake_spi2 is None else packet.fake_spi2
+    request_code = spi2 & 3
+    if request_code == 3:
+        raise PacketError("SPI2 PoR request bits 11 are reserved")
+    if spi2 & 0xC0:
+        raise PacketError("SPI2 RFU bits 7-6 must be zero")
+    requested = request_code in (1, 2)
+    if not requested and spi2 & 0x3C:
+        raise PacketError("PoR security/ciphering/mode is set while PoR is not requested")
+    if envelope_response_required and requested and spi2 & 0x20:
+        raise PacketError("SMS-SUBMIT PoR cannot be returned in the ENVELOPE APDU response")
+    return (
+        describe_por_request(packet),
+        "PoR request coding valid (SPI2 bits 1-0)",
+        "PoR is observable in ENVELOPE response" if requested and not spi2 & 0x20
+        else "PoR is not expected in ENVELOPE response",
+    )
 
 
 def decode_por_status(status: int) -> str:
@@ -280,6 +494,10 @@ class APDUResponse:
     data: bytes
     sw1: int
     sw2: int
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.sw1 <= 0xFF or not 0 <= self.sw2 <= 0xFF:
+            raise ValueError("status-word bytes must be between 00 and FF")
 
     @property
     def sw(self) -> int:
@@ -319,6 +537,9 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
     if sw in (0x6700, 0x6A80, 0x6A86, 0x6A87, 0x6A88, 0x6B00):
         return ResponseAnalysis(True, "medium", "CLA/INS likely recognized; parameters or data are invalid",
                                 "Refine P1/P2, Lc, data, and Le without treating this as unsupported")
+    if sw == 0x6A81:
+        return ResponseAnalysis(False, "none", "Requested function is not supported in this command context",
+                                "Stop this optional function/follow-up and continue the scan")
     if response.sw1 == 0x69 or sw in (0x9804, 0x9840):
         return ResponseAnalysis(True, "high", "Command recognized but blocked by security or card state",
                                 "Review PIN, access rules, selected file/application, and secure messaging")
@@ -331,8 +552,8 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
         return ResponseAnalysis(False, "none", "CLA unsupported", "Skip the remaining INS values for this CLA")
     if sw in (0x6881, 0x6882):
         if sw == 0x6881:
-            return ResponseAnalysis(False, "low", "CLA understood, but the current logical channel is unsupported",
-                                    "Open and probe UICC logical channels 1 through 19")
+            return ResponseAnalysis(False, "low", "CLA encodes a logical channel the card rejected; INS support is unproven",
+                                    "Record the filtered CLA; probe MANAGE CHANNEL only when explicitly requested")
         return ResponseAnalysis(False, "low", "CLA understood, but secure messaging is unsupported",
                                 "Try the basic channel without secure messaging")
     if response.data:
@@ -344,12 +565,29 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
 
 def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
     """Decode ISO/ETSI/3GPP UICC status words also used by GSMA profiles."""
+    if not 0 <= sw1 <= 0xFF or not 0 <= sw2 <= 0xFF:
+        raise ValueError("status-word bytes must be between 00 and FF")
     sw = sw1 << 8 | sw2
     exact = {
         0x9000: ("Command completed successfully", "success"),
+        0x6200: ("Warning: non-volatile memory unchanged; no further information", "warning"),
         0x6282: ("End of file or record reached before reading Le bytes", "warning"),
         0x6283: ("Selected file invalidated/deactivated", "warning"),
         0x6285: ("Selected file is in termination state", "warning"),
+        0x62F1: ("More data available", "response-available"),
+        0x62F2: ("More data available and proactive command pending", "proactive"),
+        0x62F3: ("Response data may be corrupted", "warning"),
+        0x62F5: ("Default agent locked", "warning"),
+        0x62F7: ("Card/application life-cycle state does not permit the command", "warning"),
+        0x62F8: ("Referenced data not found", "warning"),
+        0x62F9: ("Application selection failed", "warning"),
+        0x63F1: ("More data expected", "warning"),
+        0x63F2: ("More data expected and proactive command pending", "proactive"),
+        0x6400: ("Execution error; non-volatile memory unchanged", "error"),
+        0x6401: ("Immediate response required by the card", "error"),
+        0x6500: ("Execution error; non-volatile memory changed", "error"),
+        0x6581: ("Memory failure", "error"),
+        0x6600: ("Security-related issue", "security"),
         0x6700: ("Wrong command length", "error"),
         0x6881: ("Logical channel not supported", "unsupported"),
         0x6882: ("Secure messaging not supported", "unsupported"),
@@ -358,12 +596,14 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         0x6984: ("Referenced data invalidated", "security"),
         0x6985: ("Conditions of use not satisfied", "security"),
         0x6986: ("Command not allowed (no current EF or command context)", "supported-command"),
+        0x6987: ("Expected secure-messaging data objects missing", "security"),
         0x6988: ("Secure messaging data objects incorrect", "security"),
         0x6A80: ("Incorrect parameters in command data", "supported-command"),
         0x6A81: ("Function not supported", "unsupported"),
         0x6A82: ("File or application not found", "supported-command"),
         0x6A83: ("Record not found", "supported-command"),
         0x6A84: ("Not enough memory space", "error"),
+        0x6A85: ("Lc inconsistent with TLV structure", "supported-command"),
         0x6A86: ("Incorrect P1/P2 parameters", "supported-command"),
         0x6A87: ("Lc inconsistent with P1/P2", "supported-command"),
         0x6A88: ("Referenced data not found", "supported-command"),
@@ -372,6 +612,7 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         0x6E00: ("Class byte (CLA) not supported", "unsupported"),
         0x6F00: ("No precise diagnosis", "error"),
         0x9300: ("SIM Application Toolkit is busy", "warning"),
+        0x9200: ("Command successful after internal update retry", "warning"),
         0x9400: ("No EF selected", "supported-command"),
         0x9402: ("Out of range or invalid address", "supported-command"),
         0x9404: ("File ID or pattern not found", "supported-command"),
@@ -407,6 +648,9 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         return StatusWordInfo("Execution error; non-volatile memory unchanged", "error", "ISO/IEC 7816-4")
     if sw1 == 0x65:
         return StatusWordInfo("Execution error; non-volatile memory changed", "error", "ISO/IEC 7816-4")
+    if sw1 == 0x92:
+        return StatusWordInfo(f"Command successful after {sw2 & 0x0F} internal update retries",
+                              "warning", "3GPP TS 11.11 legacy SIM")
     if sw1 == 0x6C:
         return StatusWordInfo(f"Wrong Le; exact length is {sw2 or 256}", "supported-command", "ISO/IEC 7816-4")
     return StatusWordInfo("Unknown or application-specific status word", "unknown",
@@ -982,6 +1226,7 @@ class ScanFinding:
     value: int
     response: APDUResponse
     channel: int = 0
+    command: bytes = b""
 
 
 def encode_logical_channel_cla(cla: int, channel: int) -> int:
@@ -997,10 +1242,40 @@ APDUTraceValue = APDUResponse | Exception | None
 APDUTrace = Callable[[int, int, bytes, APDUTraceValue, bool | None], None]
 
 
+def with_correct_le(command: bytes, le: int) -> bytes:
+    """Return a corrected short APDU after a 6Cxx response.
+
+    A four-byte case-1 command becomes case 2.  For case 2/4 the final Le is
+    replaced; case-3 commands gain Le and become case 4.  Extended APDUs are
+    deliberately rejected because a two-byte Le cannot be inferred from SW2.
+    ``le=256`` is encoded as the short-APDU sentinel 00.
+    """
+    if len(command) < 4:
+        raise ValueError("APDU must contain CLA, INS, P1 and P2")
+    if not 1 <= le <= 256:
+        raise ValueError("short APDU Le must be between 1 and 256")
+    encoded_le = le & 0xFF
+    if len(command) == 4:
+        return command + bytes((encoded_le,))
+    if command[4] == 0:
+        if len(command) == 5:  # short case 2 with Le=256
+            return command[:4] + bytes((encoded_le,))
+        raise ValueError("cannot correct Le on an extended APDU from SW2")
+    lc = command[4]
+    if len(command) == 5:  # short case 2
+        return command[:4] + bytes((encoded_le,))
+    if len(command) == 5 + lc:  # short case 3
+        return command + bytes((encoded_le,))
+    if len(command) == 6 + lc:  # short case 4
+        return command[:-1] + bytes((encoded_le,))
+    raise ValueError("malformed short APDU length")
+
+
 def scan_apdus(transport: CardTransport, *, level2: bool = False,
                interesting: Callable[[APDUResponse], bool] | None = None,
                trace: APDUTrace | None = None, retries: int = 2,
-               max_consecutive_errors: int = 10) -> Iterator[ScanFinding]:
+               max_consecutive_errors: int = 10,
+               probe_logical_channels: bool = False) -> Iterator[ScanFinding]:
     """Probe CLA/INS values, tracing every exchange and yielding supported ones."""
     if retries < 0 or max_consecutive_errors < 1:
         raise ValueError("retries must be non-negative and max errors must be positive")
@@ -1009,6 +1284,7 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
     total = 256 * 256 if level2 else 256
     sequence = 0
     consecutive_errors = 0
+    probed_channel_classes: set[int] = set()
 
     def transmit(command: bytes, sequence: int) -> tuple[APDUResponse | None, Exception | None]:
         last_error = None
@@ -1046,13 +1322,28 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                     )
                 continue
             consecutive_errors = 0
+            # 6Cxx is an explicit correction, not a command failure.  Retry
+            # once using the card-provided short Le (SW2=00 means 256).
+            if response.sw1 == 0x6C:
+                try:
+                    corrected = with_correct_le(command, response.sw2 or 256)
+                except ValueError:
+                    corrected = b""
+                if corrected:
+                    if trace is not None:
+                        trace(sequence, total, command, response, None)
+                    corrected_response, last_error = transmit(corrected, sequence)
+                    if corrected_response is not None:
+                        command = corrected
+                        response = corrected_response
             combined_data = response.data
             followups = 0
             response_traced = False
-            while response.sw1 == 0x61 and followups < 8:
+            while response.sw1 in (0x61, 0x9F) and followups < 8:
                 if trace is not None and followups == 0:
                     trace(sequence, total, command, response, None)
-                # ISO/IEC 7816-4 GET RESPONSE. SW2=00 encodes the maximum short Le.
+                # ISO/UICC 61xx and classic-SIM 9Fxx both request GET RESPONSE.
+                # SW2=00 encodes the maximum short Le.
                 get_response = bytes((command[0], 0xC0, 0x00, 0x00, response.sw2))
                 followup, last_error = transmit(get_response, sequence)
                 if followup is None:
@@ -1063,14 +1354,21 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                 followups += 1
                 if trace is not None:
                     trace(sequence, total, get_response, followup,
-                          predicate(command, response) if response.sw1 != 0x61 else None)
+                          predicate(command, response) if response.sw1 not in (0x61, 0x9F) else None)
                 response_traced = True
             is_interesting = predicate(command, response)
             if trace is not None and not response_traced:
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
-                yield ScanFinding(cla << 8 | instruction, response)
-            if response.sw == 0x6881:
+                yield ScanFinding(cla << 8 | instruction, response, command=command)
+            # CLA values with channels 0..3 differ only in their low two bits.
+            # Probe a class family once; repeating MANAGE CHANNEL for F4, F5,
+            # F6 and F7 caused the same channels to be opened and closed four
+            # times and produced misleading duplicate APDUs in scan logs.
+            canonical_channel_cla = command[0] & 0xFC
+            if (probe_logical_channels and response.sw == 0x6881
+                    and canonical_channel_cla not in probed_channel_classes):
+                probed_channel_classes.add(canonical_channel_cla)
                 opened_channels: list[int] = []
                 try:
                     for _ in range(19):
@@ -1086,7 +1384,7 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                         if not 1 <= channel <= 19 or channel in opened_channels:
                             break
                         opened_channels.append(channel)
-                        channel_command = bytes((encode_logical_channel_cla(command[0], channel),)) + command[1:]
+                        channel_command = bytes((encode_logical_channel_cla(canonical_channel_cla, channel),)) + command[1:]
                         channel_response, _channel_error = transmit(channel_command, sequence)
                         if channel_response is None:
                             continue
@@ -1094,7 +1392,8 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                         if trace is not None:
                             trace(sequence, total, channel_command, channel_response, channel_interesting)
                         if channel_interesting:
-                            yield ScanFinding(cla << 8 | instruction, channel_response, channel)
+                            yield ScanFinding(cla << 8 | instruction, channel_response, channel,
+                                              channel_command)
                 finally:
                     for channel in reversed(opened_channels):
                         close_command = bytes((0x00, 0x70, 0x80, channel))
@@ -1190,6 +1489,8 @@ def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
                 kind = "DF/ADF" if value and value[0] & 0x38 == 0x38 else "EF/other"
                 shareable = "shareable" if value and value[0] & 0x40 else "not shareable"
                 details.append(f"File descriptor={raw} ({kind}, {shareable})")
+                if len(value) > 1:
+                    details.append(f"File descriptor data-coding byte={value[1]:02X}")
             elif tag == 0x83 and len(value) == 2:
                 fid = int.from_bytes(value, "big")
                 details.append(f"File identifier={fid:04X}" + (" (MF)" if fid == 0x3F00 else ""))
@@ -1198,6 +1499,10 @@ def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
                 details.append(f"Life-cycle status={value[0]:02X} ({state})")
             elif tag == 0x8B:
                 details.append(f"Security attributes (compact)={raw}")
+                if value:
+                    conditions = value[1:].hex().upper() or "none"
+                    details.append(f"Compact security: access-mode byte={value[0]:02X}, "
+                                   f"security-condition bytes={conditions}")
             elif tag == 0xA5:
                 for nested_tag, nested_value in _ber_tlvs(value):
                     nested_raw = nested_value.hex().upper()
@@ -1222,13 +1527,73 @@ def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
     return tuple(details)
 
 
+def decode_card_recognition_data(data: bytes) -> tuple[str, ...]:
+    """Decode the ISO/IEC 7816 card-recognition data object without guessing values."""
+    if not data:
+        return ("No GET DATA response data",)
+    try:
+        outer = _ber_tlvs(data)
+    except PacketError as exc:
+        return (f"Malformed card-recognition BER-TLV: {exc}",
+                f"Raw response data={data.hex().upper()}")
+    details = [f"Card-recognition response: {len(data)} byte(s)"]
+    tag_names = {
+        0x06: "Object identifier", 0x41: "Country code and national data",
+        0x42: "Issuer identification number", 0x43: "Card service data",
+        0x45: "Card issuer data", 0x46: "Pre-issuing data",
+        0x47: "Card capabilities", 0x4F: "Application identifier",
+        0x5F50: "Issuer URL", 0x73: "Card capabilities template",
+    }
+
+    def append_fields(fields: Sequence[tuple[int, bytes]], prefix: str = "") -> None:
+        for tag, value in fields:
+            label = tag_names.get(tag, f"Tag {tag:02X}")
+            raw = value.hex().upper() or "<empty>"
+            details.append(f"{prefix}{label}={raw}")
+            if tag == 0x73 and value:
+                try:
+                    append_fields(_ber_tlvs(value), prefix="  ")
+                except PacketError as exc:
+                    details.append(f"  Malformed capabilities template: {exc}")
+
+    # P1/P2=0066 normally returns the Card Recognition Data template (66).
+    # Keep accepting an unwrapped object for cards/readers that return its value.
+    if len(outer) == 1 and outer[0][0] == 0x66:
+        details.append(f"Card Recognition Data template: {len(outer[0][1])} byte(s)")
+        try:
+            append_fields(_ber_tlvs(outer[0][1]))
+        except PacketError as exc:
+            details.append(f"Malformed template content: {exc}")
+    else:
+        details.append("Response is not wrapped in Card Recognition Data tag 66")
+        append_fields(outer)
+    return tuple(details)
+
+
 def decode_tar_context_response(name: str, response: APDUResponse) -> tuple[str, ...]:
     """Return human-readable context data/status details without overclaiming."""
     if name.startswith("STATUS") and response.sw == 0x9000:
         return decode_uicc_status_data(response.data)
-    if name.startswith("GET DATA") and response.sw == 0x6D00:
-        return ("INS CA is not implemented for this CLA; GET DATA is optional in this UICC context",
-                "This result is unrelated to TAR existence, MSL, or PoR support")
+    if name.startswith("STATUS"):
+        info = decode_status_word(response.sw1, response.sw2)
+        if response.sw == 0x6E00:
+            interpretation = "Interpretation: STATUS CLA is not supported by this card/application"
+        elif response.sw == 0x6D00:
+            interpretation = "Interpretation: STATUS instruction is not supported for the selected CLA"
+        elif response.sw1 == 0x6C:
+            interpretation = f"Interpretation: STATUS requires Le={response.sw2 or 256} byte(s)"
+        elif response.sw in (0x6982, 0x6985):
+            interpretation = "Interpretation: STATUS is recognized but blocked by security/card state"
+        elif response.sw in (0x6A86, 0x6B00):
+            interpretation = "Interpretation: STATUS is recognized but P1/P2 is not accepted"
+        else:
+            interpretation = "Interpretation: STATUS returned no usable FCP/status data"
+        return (f"Status word={response.sw:04X} ({info.meaning})", interpretation,
+                "Scope: card/application context only; TAR/MSL/PoR results are unaffected")
+    if name.startswith("GET DATA") and response.sw == 0x9000:
+        return decode_card_recognition_data(response.data)
+    if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
+        return ("Object 0066 unavailable in the current card/application context",)
     return ()
 
 
@@ -1240,8 +1605,30 @@ def summarize_tar_context_response(name: str, response: APDUResponse,
                   "Available memory=", "PIN status template:")
         selected = [detail for detail in decoded if detail.startswith(wanted)]
         return "STATUS OK: " + "; ".join(selected or ("FCP returned but no standard fields decoded",))
-    if name.startswith("GET DATA") and response.sw == 0x6D00:
-        return "GET DATA unavailable for this CLA (6D00); unrelated to TAR/MSL/PoR"
+    if name.startswith("STATUS"):
+        info = decode_status_word(response.sw1, response.sw2)
+        interpretation = next((detail.removeprefix("Interpretation: ") for detail in decoded
+                               if detail.startswith("Interpretation: ")), "no status data returned")
+        return f"STATUS unavailable: SW={response.sw:04X} ({info.meaning}); {interpretation}"
+    if name.startswith("GET DATA") and response.sw == 0x9000:
+        templates = [detail for detail in decoded if "template:" in detail]
+        capabilities = sum("capabilit" in detail.lower() for detail in decoded)
+        suffix = f"; capability field(s)={capabilities}" if capabilities else ""
+        successful = next((detail for detail in decoded
+                           if detail.startswith("Attempt ") and "SW=9000" in detail), "")
+        match = re.search(r"APDU=([0-9A-F]{2})", successful)
+        via = f"; via CLA={match.group(1)}" if match else ""
+        return ("GET DATA OK: " + "; ".join(templates or (f"{len(response.data)} byte(s) returned",))
+                + suffix + via)
+    if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
+        attempts = [detail for detail in decoded if detail.startswith("Attempt ")]
+        statuses = ", ".join(
+            f"{'ISO' if detail.startswith('Attempt ISO') else 'telecom'}="
+            f"{match.group(1) if (match := re.search(r'SW=([0-9A-F]{4})', detail)) else 'unknown'}"
+            for detail in attempts
+        )
+        suffix = f"; attempts={statuses}" if statuses else f"; SW={response.sw:04X}"
+        return f"Object 0066 unavailable{suffix}; optional context probe only"
     info = decode_status_word(response.sw1, response.sw2)
     return f"{name}: SW={response.sw:04X} ({info.meaning})"
 
@@ -1257,10 +1644,13 @@ def analyze_tar_context_response(name: str, command: bytes,
         if response.sw1 == 0x6C:
             return ResponseAnalysis(True, "medium", "UICC STATUS recognized, but corrected Le was not accepted",
                                     f"Card continues to request Le={response.sw2 or 256}; do not infer TAR support")
+        info = decode_status_word(response.sw1, response.sw2)
+        return ResponseAnalysis(False, "none", f"STATUS did not return usable context: {info.meaning}",
+                                "Review the decoded SW and attempted APDU; TAR/MSL/PoR results are unaffected")
     if name.startswith("GET DATA") and response.sw in (0x6D00, 0x6E00, 0x6A81, 0x6A88):
         return ResponseAnalysis(False, "none",
-                                "Optional ISO GET DATA object is unavailable in this UICC command context",
-                                "Treat as a context capability result, not evidence for or against OTA/TAR support")
+                                "GET DATA alternatives exhausted without object 0066",
+                                "Use ATR/STATUS for card context; TAR/MSL/PoR results are unaffected")
     generic = analyze_apdu_response(command, response)
     return ResponseAnalysis(generic.interesting, generic.severity, generic.conclusion,
                             generic.next_step + "; do not infer a TAR from this context command")
@@ -1269,24 +1659,64 @@ def analyze_tar_context_response(name: str, command: bytes,
 def probe_tar_scan_context(transport: CardTransport,
                            apdu_format: APDUFormat) -> list[TARContextResult]:
     """Issue read-only GET STATUS/GET DATA context probes around a TAR scan."""
-    if apdu_format.third_gen:
-        commands = (
-            ("STATUS current UICC application", bytes.fromhex("80F2000000")),
-            ("GET DATA card recognition data", bytes.fromhex("00CA006600")),
-        )
-    else:
-        commands = (
-            ("STATUS current SIM application", bytes.fromhex("A0F2000000")),
-            ("GET DATA card recognition data", bytes.fromhex("A0CA006600")),
-        )
-    results = []
-    for name, command in commands:
+    status_name = "STATUS current UICC application" if apdu_format.third_gen else "STATUS current SIM application"
+    status_command = bytes.fromhex("80F2000000" if apdu_format.third_gen else "A0F2000000")
+    status_response, status_exchanges = _card_command_trace(transport, status_command)
+    status_attempts = tuple(
+        f"Attempt STATUS APDU={command.hex().upper()} -> SW={response.sw:04X} "
+        f"({decode_status_word(response.sw1, response.sw2).meaning})"
+        for command, response in status_exchanges
+    )
+    status_decoded = status_attempts + decode_tar_context_response(status_name, status_response)
+    results = [TARContextResult(
+        status_name, status_command, status_response,
+        analyze_tar_context_response(status_name, status_command, status_response),
+        status_exchanges, status_decoded,
+        summarize_tar_context_response(status_name, status_response, status_decoded)
+    )]
+
+    # Card Recognition Data (tag 0066) is an ISO GET DATA object. Cards differ
+    # on whether it is exposed under interindustry CLA 00 or the telecom CLA,
+    # so retain both attempts instead of presenting one 6D00 as a format error.
+    get_data_name = "GET DATA card recognition data"
+    telecom_cla = 0x80 if apdu_format.third_gen else 0xA0
+    candidates = (bytes.fromhex("00CA006600"), bytes((telecom_cla, 0xCA, 0, 0x66, 0)))
+    attempts: list[tuple[bytes, APDUResponse]] = []
+    candidate_results: list[tuple[bytes, APDUResponse]] = []
+    for command in candidates:
         response, exchanges = _card_command_trace(transport, command)
-        decoded = decode_tar_context_response(name, response)
-        results.append(TARContextResult(
-            name, command, response, analyze_tar_context_response(name, command, response),
-            exchanges, decoded, summarize_tar_context_response(name, response, decoded)
-        ))
+        attempts.extend(exchanges)
+        candidate_results.append((command, response))
+        if response.sw == 0x9000:
+            break
+    rank = {0x9000: 5, 0x6A88: 4, 0x6A81: 3, 0x6D00: 1, 0x6E00: 0}
+    command, response = max(candidate_results, key=lambda item: rank.get(item[1].sw, 2))
+    attempt_details = tuple(
+        f"Attempt {'ISO interindustry' if candidate[0] == 0 else 'UICC/SIM telecom'} "
+        f"APDU={candidate.hex().upper()} -> SW={candidate_response.sw:04X} "
+        f"({decode_status_word(candidate_response.sw1, candidate_response.sw2).meaning})"
+        for candidate, candidate_response in candidate_results
+    )
+    statuses = [candidate_response.sw for _, candidate_response in candidate_results]
+    if response.sw == 0x9000:
+        decoded = decode_card_recognition_data(response.data) + attempt_details
+    else:
+        if statuses and all(status == 0x6E00 for status in statuses):
+            interpretation = "Interpretation: both tested CLA values were rejected by the card"
+        elif any(status == 0x6A88 for status in statuses):
+            interpretation = "Interpretation: GET DATA was recognized, but object 0066 was not found"
+        elif any(status == 0x6A81 for status in statuses):
+            interpretation = "Interpretation: GET DATA/object retrieval is not supported in this context"
+        else:
+            interpretation = "Interpretation: neither tested GET DATA encoding exposed object 0066"
+        decoded = attempt_details + (interpretation,
+                                     "Scope: optional card context only; TAR/MSL/PoR results are unaffected")
+    results.append(TARContextResult(
+        get_data_name, command, response,
+        analyze_tar_context_response(get_data_name, command, response),
+        tuple(attempts), decoded,
+        summarize_tar_context_response(get_data_name, response, decoded)
+    ))
     return results
 
 
@@ -1309,6 +1739,108 @@ def classify_tar_scan_results(
         if result[4] is not None or count <= 1 or (result[3].sw, result[3].data) != baseline
     ]
     return baseline, count, findings
+
+
+def analyze_fuzzer_response_patterns(
+    results: Sequence[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]],
+) -> tuple[str, ...]:
+    """Correlate transport responses with profile, keyset, and PoR mode."""
+    if not results:
+        return ("No responses available for correlation.",)
+    lines: list[str] = []
+    parsed_count = sum(result[4] is not None for result in results)
+    empty_success = [result for result in results
+                     if result[3].sw == 0x9000 and not result[3].data and result[4] is None]
+    submit_success = [result for result in empty_success if result[2].por_mode_submit]
+    if submit_success:
+        lines.append(
+            f"{len(submit_success)} submit-mode probe(s) returned empty 9000. This confirms "
+            "ENVELOPE/TPDU transport acceptance only: an SMS-SUBMIT PoR is not returned "
+            "inside this APDU response, so OTA command execution and TAR support remain unproven."
+        )
+    warning_rows = [result for result in results if result[3].sw1 == 0x62 and not result[3].data]
+    if warning_rows:
+        lines.append(
+            f"{len(warning_rows)} probe(s) returned an empty 62xx warning. Repetition across "
+            "different TAR/keyset/security profiles indicates a shared UICC ENVELOPE/parser "
+            "path rather than independent evidence that those TARs exist."
+        )
+    # A profile with one invariant signature over several keysets is unlikely to
+    # be demonstrating successful key selection, especially without a PoR.
+    by_profile: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for label, tar, _packet, response, _parsed in results:
+        profile = label.split("/K", 1)[0]
+        by_profile.setdefault((tar, profile), []).append(
+            (label, f"{response.sw:04X}:{response.data.hex().upper()}")
+        )
+    invariant = []
+    for (tar, profile), observations in by_profile.items():
+        keysets = {label.rsplit("/K", 1)[-1] for label, _ in observations if "/K" in label}
+        signatures = {signature for _, signature in observations}
+        if len(keysets) > 1 and len(signatures) == 1:
+            invariant.append(f"{profile}:{tar} ({len(keysets)} keysets -> {next(iter(signatures)).split(':')[0]})")
+    if invariant:
+        preview = ", ".join(invariant[:8]) + (f", +{len(invariant) - 8} more" if len(invariant) > 8 else "")
+        lines.append("Keyset-invariant profiles: " + preview +
+                     ". Treat these as pre-security transport behavior unless a parseable PoR differs by keyset.")
+    if parsed_count == 0:
+        lines.append("No parseable 03.48/31.115 response packet was received; no MSL=0 vulnerability is proven.")
+    else:
+        lines.append(f"{parsed_count} parseable PoR packet(s) permit application-level TAR/MSL conclusions.")
+    return tuple(lines)
+
+
+@dataclass(frozen=True)
+class TARExistenceAssessment:
+    tar: str
+    state: str
+    exists: bool | None
+    evidence: str
+    profiles_tried: int
+    keysets_tried: tuple[int, ...]
+
+
+def assess_tar_existence(
+    results: Sequence[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]],
+) -> tuple[TARExistenceAssessment, ...]:
+    """Assess TAR presence only from structurally valid, matching PoR evidence.
+
+    A parseable PoR with a matching TAR and any RSC other than ``09`` proves
+    that routing reached the target/security domain, even when its MSL rejected
+    the command. RSC ``09`` is an explicit unknown-TAR report. Transport status
+    words alone are deliberately inconclusive. ``exists=False`` means the card
+    explicitly reported unknown TAR for the tested bearer/keysets; it is not a
+    claim about a different application, security domain, or OTA bearer.
+    """
+    grouped: dict[str, list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]]] = {}
+    for result in results:
+        grouped.setdefault(result[1], []).append(result)
+    assessments = []
+    for tar, rows in sorted(grouped.items()):
+        matching = [row for row in rows if row[4] is not None and row[4].tar == bytes.fromhex(tar)]
+        present = [row for row in matching if row[4].status_code != 0x09]
+        unknown = [row for row in matching if row[4].status_code == 0x09]
+        keysets = tuple(sorted({row[2].keyset for row in rows}))
+        profiles = len({row[0].rsplit("/K", 1)[0].split("/", 1)[-1] for row in rows})
+        if present:
+            codes = sorted({row[4].status_code for row in present})
+            state = "EXISTS ON CARD"
+            exists = True
+            evidence = (f"matching PoR received with RSC={','.join(f'{code:02X}' for code in codes)}; "
+                        "the TAR was reached even if its security policy rejected the command")
+        elif unknown:
+            state = "NOT FOUND ON TESTED ROUTE"
+            exists = False
+            evidence = (f"{len(unknown)} matching PoR(s) returned RSC=09 (unknown TAR); "
+                        "not found under the tested keysets/MSL profiles")
+        else:
+            mismatched = sum(row[4] is not None for row in rows)
+            state = "UNDETERMINED"
+            exists = None
+            evidence = ("no parseable matching PoR; APDU 9000/62xx/6F00 only confirms transport behavior"
+                        + (f"; ignored {mismatched} PoR(s) with a different/missing TAR" if mismatched else ""))
+        assessments.append(TARExistenceAssessment(tar, state, exists, evidence, profiles, keysets))
+    return tuple(assessments)
 
 
 def _hex(prompt: str, *, length: int | None = None, default: str = "") -> bytes:
@@ -1358,20 +1890,33 @@ def _print_response(packet: ResponsePacket) -> None:
                       "proprietary": packet.proprietary}, indent=2))
 
 
-def _run_scan(reader: int, level2: bool) -> None:
+def _run_scan(reader: int, level2: bool, logical_channels: bool = False) -> None:
     mode = "level 2 (CLA and INS)" if level2 else "level 1 (CLA)"
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
+    print("Logical-channel expansion: " +
+          ("enabled (MANAGE CHANNEL probes after 6881)" if logical_channels
+           else "disabled (6881 is recorded without opening channels)"), flush=True)
     status_counts: Counter[int] = Counter()
+    primary_status_counts: Counter[int] = Counter()
+    followup_status_counts: Counter[int] = Counter()
+    primary_commands: dict[int, bytes] = {}
     error_count = 0
 
     def screen_trace(sequence: int, total: int, command: bytes,
                      response: APDUTraceValue, found: bool | None) -> None:
         nonlocal error_count
         if response is None:
-            print(f"[{sequence:05d}/{total:05d}] TX APDU={command.hex().upper()}", flush=True)
+            primary = primary_commands.setdefault(sequence, command)
+            if command[:2] == bytes.fromhex("0070"):
+                operation = "CHANNEL OPEN" if command[2] == 0 else "CHANNEL CLOSE"
+            elif command != primary:
+                operation = "LOGICAL-CHANNEL PROBE"
+            else:
+                operation = "PRIMARY"
+            print(f"[{sequence:05d}/{total:05d}] TX {operation} APDU={command.hex().upper()}", flush=True)
             return
         if isinstance(response, Exception):
             error_count += 1
@@ -1383,9 +1928,29 @@ def _run_scan(reader: int, level2: bool) -> None:
         info = decode_status_word(response.sw1, response.sw2)
         analysis = analyze_apdu_response(command, response)
         status_counts[response.sw] += 1
-        result = "follow-up" if found is None else ("FOUND" if found else "filtered")
+        primary = primary_commands.get(sequence) == command
+        if primary:
+            primary_status_counts[response.sw] += 1
+        else:
+            followup_status_counts[response.sw] += 1
+        if command[:2] == bytes.fromhex("0070"):
+            if command[2] == 0 and response.sw == 0x9000 and response.data:
+                result = f"channel-opened={response.data[0]}"
+                conclusion = "MANAGE CHANNEL allocated a card-wide logical channel"
+            elif command[2] == 0 and response.sw == 0x6A81:
+                result = "channel-open-stop"
+                conclusion = "No additional logical channel is available; stop opening channels"
+            elif command[2] == 0x80 and response.sw == 0x9000:
+                result = f"channel-closed={command[3]}"
+                conclusion = "MANAGE CHANNEL closed the temporary logical channel"
+            else:
+                result = "channel-management"
+                conclusion = analysis.conclusion
+        else:
+            result = "follow-up" if found is None else ("FOUND" if found else "filtered")
+            conclusion = analysis.conclusion
         print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
-              f"{result} - {info.meaning} [{info.standard}] ANALYSIS={analysis.conclusion}", flush=True)
+              f"{result} - {info.meaning} [{info.standard}] ANALYSIS={conclusion}", flush=True)
 
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
@@ -1393,7 +1958,8 @@ def _run_scan(reader: int, level2: bool) -> None:
     findings: list[ScanFinding] = []
     aborted = False
     try:
-        for finding in scan_apdus(transport, level2=level2, trace=screen_trace):
+        for finding in scan_apdus(transport, level2=level2, trace=screen_trace,
+                                  probe_logical_channels=logical_channels):
             findings.append(finding)
             response = finding.response
             print(f"FINDING VALUE={finding.value:04X} CHANNEL={finding.channel} SW={response.sw:04X} "
@@ -1409,17 +1975,40 @@ def _run_scan(reader: int, level2: bool) -> None:
             print(f"CARD CLOSE ERROR: {exc}", flush=True)
         print("\n========== APDU SCAN SUMMARY ==========", flush=True)
         print(f"Result: {'ABORTED' if aborted else 'COMPLETED'}", flush=True)
-        print(f"Responses received: {sum(status_counts.values())}", flush=True)
+        print(f"Primary responses received: {sum(primary_status_counts.values())}", flush=True)
+        print(f"Follow-up/channel-management responses: {sum(followup_status_counts.values())}", flush=True)
         print(f"Communication errors/retries: {error_count}", flush=True)
         print(f"Potentially supported APDU values: {len(findings)}", flush=True)
-        print("Interesting findings only:", flush=True)
+        print("Primary status-word distribution:", flush=True)
+        if primary_status_counts:
+            for sw, count in primary_status_counts.most_common():
+                info = decode_status_word(sw >> 8, sw & 0xFF)
+                print(f"  SW={sw:04X} COUNT={count} CATEGORY={info.category} - {info.meaning}",
+                      flush=True)
+        else:
+            print("  None", flush=True)
+        rejected_channels = primary_status_counts[0x6881]
+        if rejected_channels:
+            mode_note = ("optional logical-channel expansion was enabled"
+                         if logical_channels else
+                         "logical-channel expansion was disabled; use --logical-channels to test it")
+            print(f"Scan interpretation: {rejected_channels} primary response(s) returned 6881. "
+                  "These CLA bytes encode logical channels rejected by the card; this does not "
+                  f"prove that INS=00 is supported. {mode_note}.", flush=True)
+        if primary_status_counts[0x6E00]:
+            print(f"Scan interpretation: {primary_status_counts[0x6E00]} primary response(s) "
+                  "returned 6E00, so those command classes were rejected.", flush=True)
+        if primary_status_counts[0x6D00]:
+            print(f"Scan interpretation: {primary_status_counts[0x6D00]} primary response(s) "
+                  "returned 6D00, so those instructions were rejected in the tested context.",
+                  flush=True)
+        print("Actionable findings:", flush=True)
         if findings:
             for finding in findings:
                 response = finding.response
                 info = decode_status_word(response.sw1, response.sw2)
-                base_cla = finding.value >> 8
-                actual_cla = encode_logical_channel_cla(base_cla, finding.channel)
-                command = bytes((actual_cla, finding.value & 0xFF, 0, 0))
+                command = finding.command or bytes((finding.value >> 8,
+                                                    finding.value & 0xFF, 0, 0))
                 analysis = analyze_apdu_response(command, response)
                 print(f"  CLA={finding.value >> 8:02X} INS={finding.value & 0xFF:02X} "
                       f"CHANNEL={finding.channel} APDU={command.hex().upper()} SW={response.sw:04X} "
@@ -1436,7 +2025,8 @@ def _run_scan(reader: int, level2: bool) -> None:
 def _run_known_tar_scan(reader: int, keyset: int,
                         groups: Iterable[str] | None = None,
                         probes: Iterable[tuple[str, CommandPacket]] | None = None,
-                        title: str = "KNOWN TAR SCAN") -> None:
+                        title: str = "KNOWN TAR SCAN", *, force_por: bool = True
+                        ) -> tuple[TARExistenceAssessment, ...]:
     """Deliver the known TAR corpus over SMS-PP and summarize card responses."""
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
@@ -1444,18 +2034,25 @@ def _run_known_tar_scan(reader: int, keyset: int,
     supplied_probes = known_tar_packets(keyset, groups) if probes is None else probes
     # A TAR scan is only conclusive when the UICC can return a response packet.
     # Force the PoR request bit even for caller-supplied packets that omitted it.
-    probe_list = [
-        (group, ensure_por_requested(packet))
-        for group, packet in supplied_probes
-    ]
+    probe_list = [(group, ensure_por_requested(packet) if force_por else packet)
+                  for group, packet in supplied_probes]
+    active_keysets = sorted({packet.keyset for _, packet in probe_list})
+    keyset_display = ",".join(map(str, active_keysets)) or str(keyset)
+    active_unsecured_msl = sorted({packet.fake_spi1 for _, packet in probe_list
+                                   if packet.fake_spi1 is not None})
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
     results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
     context_results: list[TARContextResult] = []
     errors = 0
+    apdu_validations = 0
+    por_validations = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
-          f"{reader_names[reader]}; keyset {keyset}; "
+          f"{reader_names[reader]}; keysets {keyset_display}; "
           f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
+    if active_unsecured_msl:
+        print("Unsecured SPI1/MSL probes: " +
+              ", ".join(f"MSL={value:02X}" for value in active_unsecured_msl), flush=True)
     try:
         print("Read-only card context probes:", flush=True)
         try:
@@ -1469,9 +2066,11 @@ def _run_known_tar_scan(reader: int, keyset: int,
                           f"SW={exchange_response.sw:04X} - {info.meaning}", flush=True)
                 print(f"    ANALYSIS={context.analysis.conclusion}; "
                       f"NEXT={context.analysis.next_step}", flush=True)
-                print(f"    SHORT={context.short_decoded}", flush=True)
+                print(f"    COMPACT={context.short_decoded}", flush=True)
                 if context.decoded:
-                    print("    LONG:", flush=True)
+                    print("    EXPANDED:", flush=True)
+                    if context.response.data:
+                        print(f"      - Raw response data={context.response.data.hex().upper()}", flush=True)
                     for detail in context.decoded:
                         print(f"      - {detail}", flush=True)
         except Exception as exc:
@@ -1480,7 +2079,13 @@ def _run_known_tar_scan(reader: int, keyset: int,
         for index, (group, packet) in enumerate(probe_list, 1):
             tar = packet.tar.hex().upper()
             command = build_sms_pp_download_apdu(packet, third_gen=apdu_format.third_gen)
+            validate_sms_pp_download_apdu(command, packet, third_gen=apdu_format.third_gen)
+            apdu_validations += 1
+            validate_por_request(packet)
+            por_validations += 1
             print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
+            print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX POR {describe_por_request(packet)}",
+                  flush=True)
             response = None
             for attempt in range(3):
                 try:
@@ -1532,7 +2137,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     parsed_results = [result for result in results if result[4] is not None]
     baseline_signature, baseline_count, interesting_results = classify_tar_scan_results(results)
     insecure = [result for result in parsed_results
-                if result[4].status_code == 0 and requested_msl(result[2]).startswith("MSL=0")]
+                if result[4].status_code == 0 and is_unsecured_probe(result[2])]
     por_requested = sum(1 for result in results if result[2].request_por)
     por_received = sum(1 for result in parsed_results if result[2].request_por)
     msl_attempts = Counter(requested_msl(result[2]) for result in results)
@@ -1543,6 +2148,11 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
+    print(f"3GPP/ETSI APDU structures validated: {apdu_validations}/{len(probe_list)}", flush=True)
+    print(f"3GPP/ETSI PoR SPI2 codings validated: {por_validations}/{len(probe_list)}", flush=True)
+    if active_unsecured_msl:
+        print("Unsecured MSL matrix attempted: " +
+              ", ".join(f"MSL={value:02X}" for value in active_unsecured_msl), flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
     print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
     if baseline_count:
@@ -1557,13 +2167,18 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print("GET STATUS / GET DATA context:", flush=True)
     for context in context_results:
         info = decode_status_word(context.response.sw1, context.response.sw2)
-        print(f"  {context.name}: SW={context.response.sw:04X} "
-              f"DATA={context.response.data.hex().upper() or '<empty>'} "
-              f"SEVERITY={context.analysis.severity} - {info.meaning}; "
-              f"{context.analysis.conclusion}", flush=True)
-        print(f"    SHORT: {context.short_decoded}", flush=True)
+        if context.name.startswith("GET DATA") and not context.analysis.interesting:
+            print(f"  {context.name}: RESULT=UNAVAILABLE OPTIONAL=true "
+                  f"SELECTED_SW={context.response.sw:04X} IMPACT=none", flush=True)
+        else:
+            print(f"  {context.name}: SW={context.response.sw:04X} "
+                  f"SEVERITY={context.analysis.severity} - {info.meaning}; "
+                  f"{context.analysis.conclusion}", flush=True)
+        print(f"    COMPACT: {context.short_decoded}", flush=True)
         if context.decoded:
-            print("    LONG:", flush=True)
+            print("    EXPANDED:", flush=True)
+            if context.response.data:
+                print(f"      - Raw response data={context.response.data.hex().upper()}", flush=True)
             for detail in context.decoded:
                 print(f"      - {detail}", flush=True)
     if not context_results:
@@ -1572,20 +2187,33 @@ def _run_known_tar_scan(reader: int, keyset: int,
     for level, attempts in msl_attempts.items():
         print(f"  {level}: responses={attempts}, successful-PoR={msl_successes[level]}", flush=True)
     if insecure:
-        print(f"WARNING: {len(insecure)} UNSECURE MSL=0 command(s) succeeded", flush=True)
+        print(f"WARNING: {len(insecure)} deliberately UNSECURED MSL/SPI1 probe(s) returned successful PoR",
+              flush=True)
     print(f"Interesting differential/PoR findings: {len(interesting_results)}", flush=True)
     for group, tar, packet, response, parsed in interesting_results:
         info = decode_status_word(response.sw1, response.sw2)
         ota = (f" OTA-RSC={parsed.status_code:02X}({decode_por_status(parsed.status_code)})"
                if parsed is not None else " no-PoR")
         warning = " WARNING=UNSECURE" if (parsed is not None and parsed.status_code == 0
-                                          and requested_msl(packet).startswith("MSL=0")) else ""
+                                          and is_unsecured_probe(packet)) else ""
         print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
               f"DATA={response.data.hex().upper() or '<empty>'} {requested_msl(packet)}"
               f"{warning} - {info.meaning}", flush=True)
     if not interesting_results:
         print("  None", flush=True)
+    print("Advanced response correlation:", flush=True)
+    for line in analyze_fuzzer_response_patterns(results):
+        print(f"  - {line}", flush=True)
+    assessments = assess_tar_existence(results)
+    assessment_counts = Counter(item.state for item in assessments)
+    print("TAR existence assessment (matching PoR required):", flush=True)
+    print("  " + ", ".join(f"{state}={count}" for state, count in assessment_counts.items()), flush=True)
+    for item in assessments:
+        keysets = ",".join(map(str, item.keysets_tried)) or "none"
+        print(f"  - TAR={item.tar} STATE={item.state} PROFILES={item.profiles_tried} "
+              f"KEYSETS={keysets} - {item.evidence}", flush=True)
     print("============================================", flush=True)
+    return assessments
 
 
 @dataclass(frozen=True)
@@ -1760,6 +2388,45 @@ def run_self_tests() -> int:
         assert response.tar == bytes.fromhex("B00010")
         assert response.counter == 1 and response.additional_data == bytes.fromhex("AABB")
 
+    @check("3GPP and ETSI PoR SPI2 coding")
+    def _por_spi2() -> None:
+        tar = bytes.fromhex("B00010")
+        no_por = CommandPacket(tar, request_por=False)
+        always = CommandPacket(tar)
+        error_only = CommandPacket(tar, por_on_error_only=True)
+        cc_por = CommandPacket(tar, por_security=2)
+        ciphered = CommandPacket(tar, cipher_por=True)
+        submit = CommandPacket(tar, por_mode_submit=True)
+        submit_ciphered = CommandPacket(tar, cipher_por=True, por_mode_submit=True)
+        assert [packet.spi2 for packet in
+                (no_por, always, error_only, cc_por, ciphered, submit, submit_ciphered)] == [
+                    0x00, 0x01, 0x02, 0x09, 0x11, 0x21, 0x31
+                ]
+        assert "requested-on-error" in describe_por_request(error_only)
+        assert "security=CC" in describe_por_request(cc_por)
+        assert "SMS-DELIVER-REPORT" in validate_por_request(always, envelope_response_required=True)[0]
+        try:
+            validate_por_request(submit, envelope_response_required=True)
+        except PacketError as exc:
+            assert "SMS-SUBMIT" in str(exc)
+        else:
+            raise AssertionError("SMS-SUBMIT PoR accepted as an ENVELOPE response")
+        try:
+            validate_por_request(CommandPacket(tar, fake_spi2=0x03))
+        except PacketError as exc:
+            assert "reserved" in str(exc)
+        else:
+            raise AssertionError("reserved PoR request coding accepted")
+        assert CommandPacket.parse(error_only.to_bytes()).por_on_error_only
+        reserved = bytearray(always.to_bytes())
+        reserved[7] = 0x03
+        try:
+            CommandPacket.parse(bytes(reserved))
+        except PacketError as exc:
+            assert "reserved" in str(exc)
+        else:
+            raise AssertionError("parser accepted reserved SPI2 request bits")
+
     @check("ETSI and 3GPP status word decoding")
     def _status_words() -> None:
         assert decode_status_word(0x90, 0x00).category == "success"
@@ -1767,6 +2434,15 @@ def run_self_tests() -> int:
         assert decode_status_word(0x69, 0x86).category == "supported-command"
         assert "3 retries" in decode_status_word(0x63, 0xC3).meaning
         assert "256" in decode_status_word(0x61, 0x00).meaning
+        assert decode_status_word(0x69, 0x87).category == "security"
+        assert "TLV" in decode_status_word(0x6A, 0x85).meaning
+        assert "7 internal" in decode_status_word(0x92, 0x07).meaning
+        try:
+            decode_status_word(0x100, 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range SW1 accepted")
         assert analyze_apdu_response(bytes.fromhex("00240000"), APDUResponse(b"", 0x67, 0)).interesting
         assert "recognized" in analyze_apdu_response(
             bytes.fromhex("00200000"), APDUResponse(b"", 0x6B, 0)
@@ -1792,6 +2468,26 @@ def run_self_tests() -> int:
         assert findings[0].response.data == b"XYZ"
         assert findings[0].response.sw == 0x9000
 
+    @check("short APDU cases and 6C correction")
+    def _correct_le() -> None:
+        assert with_correct_le(bytes.fromhex("00CA0000"), 256) == bytes.fromhex("00CA000000")
+        assert with_correct_le(bytes.fromhex("00CA000010"), 4) == bytes.fromhex("00CA000004")
+        assert with_correct_le(bytes.fromhex("00DA000002AABB"), 3) == bytes.fromhex("00DA000002AABB03")
+        assert with_correct_le(bytes.fromhex("00DA000002AABB10"), 3) == bytes.fromhex("00DA000002AABB03")
+        commands: list[bytes] = []
+
+        def wrong_le_card(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu == bytes.fromhex("00000000"):
+                return APDUResponse(b"", 0x6C, 0x02)
+            if apdu == bytes.fromhex("0000000002"):
+                return APDUResponse(b"OK", 0x90, 0x00)
+            return APDUResponse(b"", 0x6E, 0x00)
+
+        findings = list(scan_apdus(MockTransport(wrong_le_card)))
+        assert commands[:2] == [bytes.fromhex("00000000"), bytes.fromhex("0000000002")]
+        assert findings[0].response == APDUResponse(b"OK", 0x90, 0x00)
+
     @check("TAR generation is inclusive and resumable")
     def _tar_generation() -> None:
         assert list(tar_values([(1, 3), (10, 11)], start=2)) == [2, 3, 10, 11]
@@ -1801,17 +2497,49 @@ def run_self_tests() -> int:
         assert len(KNOWN_TAR_GROUPS["SAT"]) == 2
         assert len(KNOWN_TAR_GROUPS["WIB"]) == 20
         assert sum(map(len, KNOWN_TAR_GROUPS.values())) == 135
+        assert POPULAR_TARS == ("000000", "000001", "505348", "534054", "B00001", "B00010")
+        popular = list(known_tar_keyset_packets((1, 3), popular_only=True))
+        assert len(popular) == len(POPULAR_TARS) * 2
+        assert {packet.keyset for _, packet in popular} == {1, 3}
+        assert {packet.tar.hex().upper() for _, packet in popular} == set(POPULAR_TARS)
         packet = next(known_tar_packets(groups=("SAT",)))[1]
         assert packet.tar == bytes.fromhex("505348")
         envelope = build_sms_pp_download_apdu(packet)
         assert envelope[:5] == bytes((0x80, 0xC2, 0, 0, len(envelope) - 5))
         assert packet.to_bytes() in envelope
+        validation = validate_sms_pp_download_apdu(envelope, packet)
+        assert "CLA=80, INS=C2" in validation[0]
+        assert "network-to-UICC" in validation[1]
+        assert "PID=7F, DCS=F6" in validation[2]
+        broken = envelope[:4] + bytes((envelope[4] - 1,)) + envelope[5:]
+        try:
+            validate_sms_pp_download_apdu(broken, packet)
+        except PacketError:
+            pass
+        else:
+            raise AssertionError("invalid ENVELOPE Lc accepted")
 
     @check("standard fuzzer matrix and OTA envelope variants")
     def _fuzzing_modes() -> None:
         packets = list(standard_fuzzer_packets(("B00010",), (1,)))
-        assert len(packets) == 17
-        assert packets[0][0] == "F00/K1" and packets[-1][0] == "F16/K1"
+        assert len(packets) == 19 + len(UNSECURED_MSL_VALUES)
+        assert packets[0][0] == "F00/K1" and packets[16][0] == "F16/K1"
+        assert packets[17][0] == "U-SUBMIT/K1"
+        assert packets[18][0] == "U-SUBMIT-CIPHER-POR/K1"
+        assert all(requested_msl(packet).startswith("MSL=0") for _, packet in packets[17:19])
+        assert not packets[0][1].request_por and packets[1][1].request_por
+        assert packets[0][1].to_bytes() != packets[1][1].to_bytes()
+        tar_profiles = list(tar_msl_probe_packets((("RFM/K1", packets[0][1]),)))
+        assert len(tar_profiles) == 16 + len(UNSECURED_MSL_VALUES)
+        assert all(packet.request_por and not packet.por_mode_submit for _, packet in tar_profiles)
+        assert any(requested_msl(packet).startswith("MSL=0") for _, packet in tar_profiles)
+        assert any("CC" in requested_msl(packet) for _, packet in tar_profiles)
+        assert any("ciphering" in requested_msl(packet) for _, packet in tar_profiles)
+        raw_msl = [(label, packet) for label, packet in packets if label.startswith("MSL=")]
+        assert [packet.fake_spi1 for _, packet in raw_msl] == list(UNSECURED_MSL_VALUES)
+        assert [packet.to_bytes()[6] for _, packet in raw_msl] == list(UNSECURED_MSL_VALUES)
+        assert requested_msl(raw_msl[-1][1]).startswith("MSL=1D (unsecured SPI1 probe:")
+        assert all(is_unsecured_probe(packet) for _, packet in raw_msl)
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain
@@ -1836,6 +2564,45 @@ def run_self_tests() -> int:
         assert any("PID conclusion" in line for line in intelligence)
         assert any("no PoR/data proves OTA execution" in line for line in intelligence)
         assert any("not an unprotected-TAR finding" in line for line in intelligence)
+
+        pattern_rows = []
+        for keyset in (1, 2, 3):
+            for label, submit, sw in (("F00", False, 0x6200), ("U-SUBMIT", True, 0x9000)):
+                profile_packet = CommandPacket(bytes.fromhex("B00010"), keyset=keyset,
+                                               por_mode_submit=submit)
+                pattern_rows.append((f"{label}/K{keyset}", "B00010", profile_packet,
+                                     APDUResponse(b"", sw >> 8, sw & 0xFF), None))
+        patterns = analyze_fuzzer_response_patterns(pattern_rows)
+        assert any("transport acceptance only" in line for line in patterns)
+        assert any("shared UICC ENVELOPE/parser path" in line for line in patterns)
+        assert any("Keyset-invariant profiles" in line for line in patterns)
+        assert any("no MSL=0 vulnerability is proven" in line for line in patterns)
+
+        matching_tar = bytes.fromhex("B00010")
+        present_por = ResponsePacket(matching_tar, 0, 0, 0x0A, None, b"", b"")
+        unknown_por = ResponsePacket(matching_tar, 0, 0, 0x09, None, b"", b"")
+        existence_rows = [
+            ("F01/K1", "B00010", packets[1][1], APDUResponse(b"PoR", 0x90, 0), present_por),
+            ("F01/K1", "000000", replace(packets[1][1], tar=bytes.fromhex("000000")),
+             APDUResponse(b"PoR", 0x90, 0), replace(unknown_por, tar=bytes.fromhex("000000"))),
+            ("F01/K1", "505348", replace(packets[1][1], tar=bytes.fromhex("505348")),
+             APDUResponse(b"", 0x62, 0), None),
+        ]
+        existence = {item.tar: item for item in assess_tar_existence(existence_rows)}
+        assert existence["B00010"].state == "EXISTS ON CARD" and existence["B00010"].exists is True
+        assert existence["000000"].state == "NOT FOUND ON TESTED ROUTE" and existence["000000"].exists is False
+        assert existence["505348"].state == "UNDETERMINED" and existence["505348"].exists is None
+
+        targets = list(targeted_tar_packets(("b00010", "505348"), (1, 3)))
+        assert len(targets) == 4
+        assert {packet.tar.hex().upper() for _, packet in targets} == {"B00010", "505348"}
+        assert {packet.keyset for _, packet in targets} == {1, 3}
+        try:
+            list(targeted_tar_packets(("B001",), (1,)))
+        except PacketError:
+            pass
+        else:
+            raise AssertionError("short targeted TAR accepted")
 
     @check("combined ATR index, forced PoR and TAR context probes")
     def _tar_scan_intelligence() -> None:
@@ -1874,10 +2641,21 @@ def run_self_tests() -> int:
         assert "UICC STATUS succeeded" in context[0].analysis.conclusion
         assert context[1].response.sw == 0x6A88
         assert not context[1].analysis.interesting
-        assert "Optional ISO GET DATA" in context[1].analysis.conclusion
+        assert "without object 0066" in context[1].analysis.conclusion
         assert commands == [bytes.fromhex(value) for value in (
-            "80F2000000", "80F200002B", "00CA006600"
+            "80F2000000", "80F200002B", "00CA006600", "80CA006600"
         )]
+        assert any("APDU=00CA006600 -> SW=6A88" in detail for detail in context[1].decoded)
+        assert any("APDU=80CA006600 -> SW=6A88" in detail for detail in context[1].decoded)
+        dual_unsupported = (
+            "Attempt ISO interindustry APDU=00CA006600 -> SW=6E00 (Class byte not supported)",
+            "Attempt UICC/SIM telecom APDU=80CA006600 -> SW=6E00 (Class byte not supported)",
+            "Interpretation: both tested CLA values were rejected by the card",
+            "Scope: optional card context only; TAR/MSL/PoR results are unaffected",
+        )
+        assert summarize_tar_context_response(
+            "GET DATA card recognition data", APDUResponse(b"", 0x6E, 0), dual_unsupported
+        ) == "Object 0066 unavailable; attempts=ISO=6E00, telecom=6E00; optional context probe only"
         packet = CommandPacket(bytes.fromhex("000000"))
         scan_rows = [
             ("RAM", f"{index:06X}", packet, APDUResponse(b"", 0x62, 0), None)
@@ -1904,14 +2682,51 @@ def run_self_tests() -> int:
         assert short.startswith("STATUS OK:")
         assert "File identifier=3F00 (MF)" in short
         assert "Available memory=273872 byte(s)" in short
+        status_denied = APDUResponse(b"", 0x69, 0x82)
+        denied_decoded = decode_tar_context_response("STATUS current UICC application", status_denied)
+        assert "blocked by security/card state" in denied_decoded[1]
+        assert summarize_tar_context_response(
+            "STATUS current UICC application", status_denied, denied_decoded
+        ) == ("STATUS unavailable: SW=6982 (Security status not satisfied); "
+              "STATUS is recognized but blocked by security/card state")
         get_data = decode_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00)
         )
-        assert "optional" in get_data[0] and "unrelated to TAR" in get_data[1]
+        assert get_data == ("Object 0066 unavailable in the current card/application context",)
         get_data_short = summarize_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00), get_data
         )
-        assert get_data_short == "GET DATA unavailable for this CLA (6D00); unrelated to TAR/MSL/PoR"
+        assert get_data_short == "Object 0066 unavailable; SW=6D00; optional context probe only"
+
+        recognition = bytes.fromhex("660A4602010273044702AABB")
+        recognition_decoded = decode_card_recognition_data(recognition)
+        assert "Card Recognition Data template: 10 byte(s)" in recognition_decoded
+        assert "Pre-issuing data=0102" in recognition_decoded
+        assert "  Card capabilities=AABB" in recognition_decoded
+        get_data_ok = summarize_tar_context_response(
+            "GET DATA card recognition data", APDUResponse(recognition, 0x90, 0),
+            recognition_decoded
+        )
+        assert get_data_ok.startswith("GET DATA OK: Card Recognition Data template:")
+
+        fallback_commands: list[bytes] = []
+        def get_data_fallback(apdu: bytes) -> APDUResponse:
+            fallback_commands.append(apdu)
+            if apdu == bytes.fromhex("80F2000000"):
+                return APDUResponse(b"FCP", 0x90, 0)
+            if apdu == bytes.fromhex("00CA006600"):
+                return APDUResponse(b"", 0x6E, 0)
+            if apdu == bytes.fromhex("80CA006600"):
+                return APDUResponse(recognition, 0x90, 0)
+            return APDUResponse(b"", 0x6D, 0)
+        fallback = probe_tar_scan_context(
+            MockTransport(get_data_fallback), APDUFormat("3G/UICC", True, 0, 0x80)
+        )[1]
+        assert fallback.response == APDUResponse(recognition, 0x90, 0)
+        assert fallback.command == bytes.fromhex("80CA006600")
+        assert "via CLA=80" in fallback.short_decoded
+        assert any("APDU=00CA006600 -> SW=6E00" in detail for detail in fallback.decoded)
+        assert any("APDU=80CA006600 -> SW=9000" in detail for detail in fallback.decoded)
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
@@ -1951,8 +2766,17 @@ def run_self_tests() -> int:
         assert list(scan_apdus(MockTransport(unsupported_cla), level2=True)) == []
         assert calls == 256
 
-    @check("6881 opens and probes 3GPP logical channels")
+    @check("6881 is passive by default and optionally probes logical channels")
     def _logical_channels() -> None:
+        default_commands: list[bytes] = []
+        def default_6881(apdu: bytes) -> APDUResponse:
+            default_commands.append(apdu)
+            return APDUResponse(b"", 0x68, 0x81)
+
+        assert list(scan_apdus(MockTransport(default_6881))) == []
+        assert len(default_commands) == 256
+        assert bytes.fromhex("0070000001") not in default_commands
+
         commands: list[bytes] = []
 
         def channel_card(apdu: bytes) -> APDUResponse:
@@ -1967,9 +2791,10 @@ def run_self_tests() -> int:
                 return APDUResponse(b"", 0x90, 0)
             return APDUResponse(b"", 0x6E, 0)
 
-        scanner = scan_apdus(MockTransport(channel_card))
+        scanner = scan_apdus(MockTransport(channel_card), probe_logical_channels=True)
         finding = next(scanner)
         assert finding.channel == 1 and finding.response.data == b"channel-one"
+        assert finding.command == bytes.fromhex("01000000")
         scanner.close()
         assert commands[:3] == [bytes.fromhex("00000000"), bytes.fromhex("0070000001"),
                                bytes.fromhex("01000000")]
@@ -1977,6 +2802,29 @@ def run_self_tests() -> int:
         assert encode_logical_channel_cla(0x00, 4) == 0x40
         assert encode_logical_channel_cla(0x00, 19) == 0x4F
         assert encode_logical_channel_cla(0x80, 4) == 0xC0
+
+        family_commands: list[bytes] = []
+        channel_open = False
+        def repeated_6881(apdu: bytes) -> APDUResponse:
+            nonlocal channel_open
+            family_commands.append(apdu)
+            if apdu == bytes.fromhex("0070000001"):
+                if not channel_open:
+                    channel_open = True
+                    return APDUResponse(b"\x01", 0x90, 0)
+                return APDUResponse(b"", 0x6A, 0x81)
+            if apdu == bytes.fromhex("00708001"):
+                return APDUResponse(b"", 0x90, 0)
+            if apdu[0] in range(0xF4, 0xF8):
+                return APDUResponse(b"", 0x68, 0x81)
+            return APDUResponse(b"", 0x6E, 0)
+
+        assert list(scan_apdus(MockTransport(repeated_6881),
+                               probe_logical_channels=True)) == []
+        # F4..F7 are one CLA family with channel bits 0..3: manage it once,
+        # rather than reopening the same card-wide channels for every raw CLA.
+        assert family_commands.count(bytes.fromhex("0070000001")) == 2
+        assert family_commands.count(bytes.fromhex("00708001")) == 1
 
     @check("APDU scan retries and skips communication errors")
     def _apdu_retry() -> None:
@@ -2116,30 +2964,49 @@ def interactive_menu() -> int:
             if choice == "0":
                 return 0
             if choice == "1":
-                tars = input("TARs comma-separated [000000,B00001,B00010]: ").strip()
-                tar_list = [value.strip().upper() for value in (tars or "000000,B00001,B00010").split(",")]
+                default_tars = ",".join(POPULAR_TARS)
+                tars = input(f"TARs comma-separated [{default_tars}]: ").strip()
+                tar_list = [value.strip().upper() for value in (tars or default_tars).split(",")]
                 keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
-                keyset_list = [int(value) for value in (keysets or "1,2,3,4,5,6").split(",")]
+                keyset_list = [int(value) for value in (keysets or ",".join(map(str, POPULAR_KEYSETS))).split(",")]
                 reader = _select_reader()
                 _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
-                                    title="STANDARD FUZZING")
+                                    title="STANDARD FUZZING", force_por=False)
             elif choice == "2":
-                mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
-                keyset = _read_int("Keyset [0]: ")
-                if mode == "range":
+                mode = input("Known corpus, TAR list, or hexadecimal range? [known/target/range]: ").strip().lower() or "known"
+                entered_keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
+                keysets = tuple(int(value) for value in
+                                (entered_keysets or ",".join(map(str, POPULAR_KEYSETS))).split(","))
+                all_msl = input("Test all response-capable MSL profiles? [Y/n]: ").strip().lower() != "n"
+                if mode == "target":
+                    entered_tars = input("TARs comma-separated [B00010]: ").strip() or "B00010"
+                    reader = _select_reader()
+                    base_probes = targeted_tar_packets(entered_tars.split(","), keysets)
+                    probes = tar_msl_probe_packets(base_probes) if all_msl else base_probes
+                    _run_known_tar_scan(reader, keysets[0], probes=probes, title="TARGETED TAR CHECK")
+                elif mode == "range":
                     low = _read_int("First TAR hex [000000]: ", base=16)
                     high = _read_int("Last TAR hex [0000FF]: ", 0xFF, 16)
                     reader = _select_reader()
-                    probes = (("RANGE", packet) for packet in build_tar_packets([(low, high)], keyset=keyset))
-                    _run_known_tar_scan(reader, keyset, probes=probes, title="TAR RANGE SCAN")
+                    base_probes = ((f"RANGE/K{keyset}", packet) for keyset in keysets
+                                   for packet in build_tar_packets([(low, high)], keyset=keyset))
+                    probes = tar_msl_probe_packets(base_probes) if all_msl else base_probes
+                    _run_known_tar_scan(reader, keysets[0], probes=probes, title="TAR RANGE SCAN")
                 else:
                     groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
                     selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                    quick = input("Popular TARs only? [Y/n]: ").strip().lower() != "n"
                     reader = _select_reader()
-                    _run_known_tar_scan(reader, keyset, selected)
+                    base_probes = known_tar_keyset_packets(keysets, selected, popular_only=quick)
+                    probes = tar_msl_probe_packets(base_probes) if all_msl else base_probes
+                    _run_known_tar_scan(reader, keysets[0], probes=probes,
+                                        title="POPULAR TAR SCAN" if quick else "KNOWN TAR SCAN")
             elif choice == "3":
                 level = _read_int("APDU scan level [1]: ", 1)
-                _run_scan(_select_reader(), level == 2)
+                logical_channels = input(
+                    "Expand 6881 results with temporary logical channels? [y/N]: "
+                ).strip().lower() == "y"
+                _run_scan(_select_reader(), level == 2, logical_channels)
             elif choice == "4":
                 tar = input("TAR [B00010]: ").strip().upper() or "B00010"
                 keyset = _read_int("Keyset [0]: ")
@@ -2167,13 +3034,28 @@ def make_parser() -> argparse.ArgumentParser:
     parse.add_argument("hex"); parse.add_argument("--lenient", action="store_true")
     scan = commands.add_parser("scan-apdu")
     scan.add_argument("--reader", type=int, default=0); scan.add_argument("--level2", action="store_true")
+    scan.add_argument("--logical-channels", action="store_true",
+                      help="open temporary logical channels to expand 6881 results (off by default)")
     known = commands.add_parser("known-tars")
-    known.add_argument("--keyset", type=int, default=0)
+    known.add_argument("--keyset", type=int, help="single keyset (legacy alias)")
+    known.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
     known.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
+    known.add_argument("--popular-only", action="store_true")
     known_scan = commands.add_parser("scan-known-tars")
     known_scan.add_argument("--reader", type=int, default=0)
-    known_scan.add_argument("--keyset", type=int, default=0)
+    known_scan.add_argument("--keyset", type=int, help="single keyset (legacy alias)")
+    known_scan.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
     known_scan.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
+    known_scan.add_argument("--popular-only", action="store_true")
+    known_scan.add_argument("--single-profile", action="store_true",
+                            help="use only the basic MSL=0 profile instead of all response-capable MSL profiles")
+    check_tar = commands.add_parser("check-tar", help="check whether specific TARs exist on a card")
+    check_tar.add_argument("tars", nargs="+", help="three-byte hexadecimal TAR values")
+    check_tar.add_argument("--reader", type=int, default=0)
+    check_tar.add_argument("--keyset", type=int, help="single keyset")
+    check_tar.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
+    check_tar.add_argument("--single-profile", action="store_true",
+                           help="use only basic MSL=0 instead of the complete response-capable matrix")
     commands.add_parser("menu")
     commands.add_parser("self-test")
     return parser
@@ -2191,18 +3073,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "parse-response":
         _print_response(ResponsePacket.parse(bytes.fromhex(args.hex), strict=not args.lenient))
     elif args.command == "scan-apdu":
-        _run_scan(args.reader, args.level2)
+        _run_scan(args.reader, args.level2, args.logical_channels)
     elif args.command == "known-tars":
         selected = None if args.groups.upper() == "ALL" else tuple(
             group.strip().upper() for group in args.groups.split(",")
         )
-        for group, packet in known_tar_packets(args.keyset, selected):
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        for group, packet in known_tar_keyset_packets(keysets, selected,
+                                                       popular_only=args.popular_only):
             print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
     elif args.command == "scan-known-tars":
         selected = None if args.groups.upper() == "ALL" else tuple(
             group.strip().upper() for group in args.groups.split(",")
         )
-        _run_known_tar_scan(args.reader, args.keyset, selected)
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        base_probes = known_tar_keyset_packets(keysets, selected, popular_only=args.popular_only)
+        probes = base_probes if args.single_profile else tar_msl_probe_packets(base_probes)
+        _run_known_tar_scan(args.reader, keysets[0], probes=probes,
+                            title="POPULAR TAR SCAN" if args.popular_only else "KNOWN TAR SCAN")
+    elif args.command == "check-tar":
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        base_probes = targeted_tar_packets(args.tars, keysets)
+        probes = base_probes if args.single_profile else tar_msl_probe_packets(base_probes)
+        assessments = _run_known_tar_scan(args.reader, keysets[0], probes=probes,
+                                          title="TARGETED TAR CHECK")
+        print("\nTARGETED RESULT:")
+        for item in assessments:
+            answer = "YES" if item.exists is True else "NO" if item.exists is False else "UNKNOWN"
+            print(f"  TAR={item.tar} EXISTS={answer} - {item.evidence}")
     return 0
 
 
