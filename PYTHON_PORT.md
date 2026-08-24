@@ -106,6 +106,10 @@ Both ATR sources are checked independently. Their raw matches are filtered to
 telecom indicators (SIM/UICC/USIM/eSIM, GSM/UMTS/LTE/3G/4G/5G, mobile/operator)
 and accepted only when attributed to a recognized major SIM manufacturer;
 payment cards, access badges, and unknown-vendor entries are excluded.
+When a probe returns `6881`, the scanner uses MANAGE CHANNEL to open every
+logical channel offered by the UICC (channels 1 through 19), applies ISO/IEC
+7816-4/ETSI channel CLA encoding, retries the APDU on each channel, records the
+channel in findings, and closes every channel afterward.
 
 There is nothing to install and no second Python source file. Examples:
 

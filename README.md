@@ -20,6 +20,7 @@
 > ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
 > EFTLab's ATR list is a second source, and SW analysis adds severity and next-step guidance.
 > ATR matches are restricted to telecom cards from recognized major SIM vendors.
+> `6881` triggers safe MANAGE CHANNEL probing across UICC logical channels 1-19.
 
 SIMTester assess SIM card security in two dimensions:
 

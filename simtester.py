@@ -326,7 +326,10 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
     if sw == 0x6E00:
         return ResponseAnalysis(False, "none", "CLA unsupported", "Skip the remaining INS values for this CLA")
     if sw in (0x6881, 0x6882):
-        return ResponseAnalysis(False, "low", "CLA understood, but channel or secure-messaging function unsupported",
+        if sw == 0x6881:
+            return ResponseAnalysis(False, "low", "CLA understood, but the current logical channel is unsupported",
+                                    "Open and probe UICC logical channels 1 through 19")
+        return ResponseAnalysis(False, "low", "CLA understood, but secure messaging is unsupported",
                                 "Try the basic channel without secure messaging")
     if response.data:
         return ResponseAnalysis(True, "medium", "Application-specific status returned data",
@@ -925,6 +928,16 @@ def print_sim_summary(transport: CardTransport,
 class ScanFinding:
     value: int
     response: APDUResponse
+    channel: int = 0
+
+
+def encode_logical_channel_cla(cla: int, channel: int) -> int:
+    """Encode ISO/IEC 7816-4 / ETSI UICC logical channels 0 through 19."""
+    if not 0 <= channel <= 19:
+        raise ValueError("logical channel must be between 0 and 19")
+    if channel <= 3:
+        return (cla & 0xFC) | channel
+    return (cla & 0xB0) | 0x40 | (channel - 4)
 
 
 APDUTraceValue = APDUResponse | Exception | None
@@ -1004,6 +1017,37 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
                 yield ScanFinding(cla << 8 | instruction, response)
+            if response.sw == 0x6881:
+                opened_channels: list[int] = []
+                try:
+                    for _ in range(19):
+                        open_command = bytes.fromhex("0070000001")
+                        opened, _open_error = transmit(open_command, sequence)
+                        if opened is None:
+                            break
+                        if trace is not None:
+                            trace(sequence, total, open_command, opened, None)
+                        if opened.sw != 0x9000 or not opened.data:
+                            break
+                        channel = opened.data[0]
+                        if not 1 <= channel <= 19 or channel in opened_channels:
+                            break
+                        opened_channels.append(channel)
+                        channel_command = bytes((encode_logical_channel_cla(command[0], channel),)) + command[1:]
+                        channel_response, _channel_error = transmit(channel_command, sequence)
+                        if channel_response is None:
+                            continue
+                        channel_interesting = predicate(channel_command, channel_response)
+                        if trace is not None:
+                            trace(sequence, total, channel_command, channel_response, channel_interesting)
+                        if channel_interesting:
+                            yield ScanFinding(cla << 8 | instruction, channel_response, channel)
+                finally:
+                    for channel in reversed(opened_channels):
+                        close_command = bytes((0x00, 0x70, 0x80, channel))
+                        closed, _close_error = transmit(close_command, sequence)
+                        if trace is not None and closed is not None:
+                            trace(sequence, total, close_command, closed, None)
             if level2 and response.sw == 0x6E00:
                 # CLA is rejected, so the remaining 255 INS probes cannot add
                 # information for this class.
@@ -1108,7 +1152,7 @@ def _run_scan(reader: int, level2: bool) -> None:
         for finding in scan_apdus(transport, level2=level2, trace=screen_trace):
             findings.append(finding)
             response = finding.response
-            print(f"FINDING VALUE={finding.value:04X} SW={response.sw:04X} "
+            print(f"FINDING VALUE={finding.value:04X} CHANNEL={finding.channel} SW={response.sw:04X} "
                   f"DATA={response.data.hex().upper() or '<empty>'}", flush=True)
     except RuntimeError as exc:
         aborted = True
@@ -1129,10 +1173,12 @@ def _run_scan(reader: int, level2: bool) -> None:
             for finding in findings:
                 response = finding.response
                 info = decode_status_word(response.sw1, response.sw2)
-                command = bytes((finding.value >> 8, finding.value & 0xFF, 0, 0))
+                base_cla = finding.value >> 8
+                actual_cla = encode_logical_channel_cla(base_cla, finding.channel)
+                command = bytes((actual_cla, finding.value & 0xFF, 0, 0))
                 analysis = analyze_apdu_response(command, response)
                 print(f"  CLA={finding.value >> 8:02X} INS={finding.value & 0xFF:02X} "
-                      f"APDU={finding.value:04X}0000 SW={response.sw:04X} "
+                      f"CHANNEL={finding.channel} APDU={command.hex().upper()} SW={response.sw:04X} "
                       f"DATA={response.data.hex().upper() or '<empty>'} SEVERITY={analysis.severity} "
                       f"- {info.meaning}; {analysis.conclusion}; NEXT={analysis.next_step}", flush=True)
         else:
@@ -1415,6 +1461,33 @@ def run_self_tests() -> int:
 
         assert list(scan_apdus(MockTransport(unsupported_cla), level2=True)) == []
         assert calls == 256
+
+    @check("6881 opens and probes 3GPP logical channels")
+    def _logical_channels() -> None:
+        commands: list[bytes] = []
+
+        def channel_card(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu == bytes.fromhex("00000000"):
+                return APDUResponse(b"", 0x68, 0x81)
+            if apdu == bytes.fromhex("0070000001"):
+                return APDUResponse(b"\x01", 0x90, 0)
+            if apdu == bytes.fromhex("01000000"):
+                return APDUResponse(b"channel-one", 0x90, 0)
+            if apdu == bytes.fromhex("00708001"):
+                return APDUResponse(b"", 0x90, 0)
+            return APDUResponse(b"", 0x6E, 0)
+
+        scanner = scan_apdus(MockTransport(channel_card))
+        finding = next(scanner)
+        assert finding.channel == 1 and finding.response.data == b"channel-one"
+        scanner.close()
+        assert commands[:3] == [bytes.fromhex("00000000"), bytes.fromhex("0070000001"),
+                               bytes.fromhex("01000000")]
+        assert commands[-1] == bytes.fromhex("00708001")
+        assert encode_logical_channel_cla(0x00, 4) == 0x40
+        assert encode_logical_channel_cla(0x00, 19) == 0x4F
+        assert encode_logical_channel_cla(0x80, 4) == 0xC0
 
     @check("APDU scan retries and skips communication errors")
     def _apdu_retry() -> None:
