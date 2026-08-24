@@ -20,13 +20,13 @@
 > ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
 > EFTLab's ATR list is a second source, and SW analysis adds severity and next-step guidance.
 > ATR matches are restricted to telecom cards from recognized major SIM vendors.
-> `6881` triggers safe MANAGE CHANNEL probing across UICC logical channels 1-19.
+> `6881` triggers one safe MANAGE CHANNEL probe per normalized CLA family, not per channel-coded byte.
 > OTA summaries correlate PID/DCS/UDHI differences and distinguish empty 9000 from PoR.
 > Repeated DCS/UDHI `9000`/`62xx` patterns are identified as parser-path evidence,
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; current scans identify build `context-status-detail-v15`.
+> Use `python simtester.py --version`; current scans identify build `channel-scan-dedup-v16`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
 > Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
 > field-level decode with the raw response retained for auditing. UICC GET DATA
@@ -39,6 +39,9 @@
 > STATUS also logs every initial/corrected APDU. Successful FCP responses include
 > descriptor/data-coding, lifecycle, memory, compact-security, and PIN details;
 > failed STATUS responses include a decoded SW, interpretation, and scope.
+> APDU scans normalize CLA channel bits and run MANAGE CHANNEL only once per
+> class family, label open/probe/close exchanges, and count primary responses
+> separately from follow-up channel-management traffic.
 > Quick scans default to popular TARs `000000`, `000001`, `505348`, `534054`,
 > `B00001`, and `B00010` across commonly used keysets 1-6. Standard fuzzing
 > also checks submit-mode clear and ciphered PoR requests with MSL=0 commands.

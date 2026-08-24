@@ -143,10 +143,12 @@ The pcsc-tools text and normalized EFTLab HTML are now assembled into one
 in-process ATR lookup index, with both source locations retained in
 the summary. Local snapshots can still be selected through the environment
 variables for fully offline and reproducible matching.
-When a probe returns `6881`, the scanner uses MANAGE CHANNEL to open every
-logical channel offered by the UICC (channels 1 through 19), applies ISO/IEC
-7816-4/ETSI channel CLA encoding, retries the APDU on each channel, records the
-channel in findings, and closes every channel afterward.
+When a probe returns `6881`, the scanner normalizes CLA channel bits and uses
+MANAGE CHANNEL once for that class family to open the logical channels offered
+by the UICC (channels 1 through 19). It applies ISO/IEC 7816-4/ETSI channel CLA
+encoding, retries the APDU, records supported-channel findings, and closes every
+temporary channel. Thus raw CLA bytes such as `F4` through `F7` no longer reopen
+and retest the same card-wide channels four times.
 OTA fuzzing performs controlled PID/DCS/UDHI comparisons, identifies which
 parameter changes correlate with status-word changes, separates warning variants
 from the dominant response, measures parseable PoR support, and explicitly avoids
@@ -167,7 +169,7 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the current build reports `context-status-detail-v15`.
+being executed, and the current build reports `channel-scan-dedup-v16`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as

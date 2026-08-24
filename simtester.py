@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.4.4"
-BUILD_ID = "context-status-detail-v15"
+__version__ = "0.4.5"
+BUILD_ID = "channel-scan-dedup-v16"
 
 
 class PacketError(ValueError):
@@ -537,6 +537,9 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
     if sw in (0x6700, 0x6A80, 0x6A86, 0x6A87, 0x6A88, 0x6B00):
         return ResponseAnalysis(True, "medium", "CLA/INS likely recognized; parameters or data are invalid",
                                 "Refine P1/P2, Lc, data, and Le without treating this as unsupported")
+    if sw == 0x6A81:
+        return ResponseAnalysis(False, "none", "Requested function is not supported in this command context",
+                                "Stop this optional function/follow-up and continue the scan")
     if response.sw1 == 0x69 or sw in (0x9804, 0x9840):
         return ResponseAnalysis(True, "high", "Command recognized but blocked by security or card state",
                                 "Review PIN, access rules, selected file/application, and secure messaging")
@@ -1279,6 +1282,7 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
     total = 256 * 256 if level2 else 256
     sequence = 0
     consecutive_errors = 0
+    probed_channel_classes: set[int] = set()
 
     def transmit(command: bytes, sequence: int) -> tuple[APDUResponse | None, Exception | None]:
         last_error = None
@@ -1355,7 +1359,13 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
                 yield ScanFinding(cla << 8 | instruction, response)
-            if response.sw == 0x6881:
+            # CLA values with channels 0..3 differ only in their low two bits.
+            # Probe a class family once; repeating MANAGE CHANNEL for F4, F5,
+            # F6 and F7 caused the same channels to be opened and closed four
+            # times and produced misleading duplicate APDUs in scan logs.
+            canonical_channel_cla = command[0] & 0xFC
+            if response.sw == 0x6881 and canonical_channel_cla not in probed_channel_classes:
+                probed_channel_classes.add(canonical_channel_cla)
                 opened_channels: list[int] = []
                 try:
                     for _ in range(19):
@@ -1371,7 +1381,7 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                         if not 1 <= channel <= 19 or channel in opened_channels:
                             break
                         opened_channels.append(channel)
-                        channel_command = bytes((encode_logical_channel_cla(command[0], channel),)) + command[1:]
+                        channel_command = bytes((encode_logical_channel_cla(canonical_channel_cla, channel),)) + command[1:]
                         channel_response, _channel_error = transmit(channel_command, sequence)
                         if channel_response is None:
                             continue
@@ -1883,13 +1893,23 @@ def _run_scan(reader: int, level2: bool) -> None:
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
     status_counts: Counter[int] = Counter()
+    primary_status_counts: Counter[int] = Counter()
+    followup_status_counts: Counter[int] = Counter()
+    primary_commands: dict[int, bytes] = {}
     error_count = 0
 
     def screen_trace(sequence: int, total: int, command: bytes,
                      response: APDUTraceValue, found: bool | None) -> None:
         nonlocal error_count
         if response is None:
-            print(f"[{sequence:05d}/{total:05d}] TX APDU={command.hex().upper()}", flush=True)
+            primary = primary_commands.setdefault(sequence, command)
+            if command[:2] == bytes.fromhex("0070"):
+                operation = "CHANNEL OPEN" if command[2] == 0 else "CHANNEL CLOSE"
+            elif command != primary:
+                operation = "LOGICAL-CHANNEL PROBE"
+            else:
+                operation = "PRIMARY"
+            print(f"[{sequence:05d}/{total:05d}] TX {operation} APDU={command.hex().upper()}", flush=True)
             return
         if isinstance(response, Exception):
             error_count += 1
@@ -1901,9 +1921,29 @@ def _run_scan(reader: int, level2: bool) -> None:
         info = decode_status_word(response.sw1, response.sw2)
         analysis = analyze_apdu_response(command, response)
         status_counts[response.sw] += 1
-        result = "follow-up" if found is None else ("FOUND" if found else "filtered")
+        primary = primary_commands.get(sequence) == command
+        if primary:
+            primary_status_counts[response.sw] += 1
+        else:
+            followup_status_counts[response.sw] += 1
+        if command[:2] == bytes.fromhex("0070"):
+            if command[2] == 0 and response.sw == 0x9000 and response.data:
+                result = f"channel-opened={response.data[0]}"
+                conclusion = "MANAGE CHANNEL allocated a card-wide logical channel"
+            elif command[2] == 0 and response.sw == 0x6A81:
+                result = "channel-open-stop"
+                conclusion = "No additional logical channel is available; stop opening channels"
+            elif command[2] == 0x80 and response.sw == 0x9000:
+                result = f"channel-closed={command[3]}"
+                conclusion = "MANAGE CHANNEL closed the temporary logical channel"
+            else:
+                result = "channel-management"
+                conclusion = analysis.conclusion
+        else:
+            result = "follow-up" if found is None else ("FOUND" if found else "filtered")
+            conclusion = analysis.conclusion
         print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
-              f"{result} - {info.meaning} [{info.standard}] ANALYSIS={analysis.conclusion}", flush=True)
+              f"{result} - {info.meaning} [{info.standard}] ANALYSIS={conclusion}", flush=True)
 
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
@@ -1927,7 +1967,8 @@ def _run_scan(reader: int, level2: bool) -> None:
             print(f"CARD CLOSE ERROR: {exc}", flush=True)
         print("\n========== APDU SCAN SUMMARY ==========", flush=True)
         print(f"Result: {'ABORTED' if aborted else 'COMPLETED'}", flush=True)
-        print(f"Responses received: {sum(status_counts.values())}", flush=True)
+        print(f"Primary responses received: {sum(primary_status_counts.values())}", flush=True)
+        print(f"Follow-up/channel-management responses: {sum(followup_status_counts.values())}", flush=True)
         print(f"Communication errors/retries: {error_count}", flush=True)
         print(f"Potentially supported APDU values: {len(findings)}", flush=True)
         print("Interesting findings only:", flush=True)
@@ -2721,6 +2762,28 @@ def run_self_tests() -> int:
         assert encode_logical_channel_cla(0x00, 4) == 0x40
         assert encode_logical_channel_cla(0x00, 19) == 0x4F
         assert encode_logical_channel_cla(0x80, 4) == 0xC0
+
+        family_commands: list[bytes] = []
+        channel_open = False
+        def repeated_6881(apdu: bytes) -> APDUResponse:
+            nonlocal channel_open
+            family_commands.append(apdu)
+            if apdu == bytes.fromhex("0070000001"):
+                if not channel_open:
+                    channel_open = True
+                    return APDUResponse(b"\x01", 0x90, 0)
+                return APDUResponse(b"", 0x6A, 0x81)
+            if apdu == bytes.fromhex("00708001"):
+                return APDUResponse(b"", 0x90, 0)
+            if apdu[0] in range(0xF4, 0xF8):
+                return APDUResponse(b"", 0x68, 0x81)
+            return APDUResponse(b"", 0x6E, 0)
+
+        assert list(scan_apdus(MockTransport(repeated_6881))) == []
+        # F4..F7 are one CLA family with channel bits 0..3: manage it once,
+        # rather than reopening the same card-wide channels for every raw CLA.
+        assert family_commands.count(bytes.fromhex("0070000001")) == 2
+        assert family_commands.count(bytes.fromhex("00708001")) == 1
 
     @check("APDU scan retries and skips communication errors")
     def _apdu_retry() -> None:
