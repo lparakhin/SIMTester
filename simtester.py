@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.2"
-BUILD_ID = "uicc-fcp-decode-v3"
+__version__ = "0.3.3"
+BUILD_ID = "uicc-short-long-v4"
 
 
 class PacketError(ValueError):
@@ -1128,6 +1128,7 @@ class TARContextResult:
     analysis: ResponseAnalysis
     exchanges: tuple[tuple[bytes, APDUResponse], ...] = ()
     decoded: tuple[str, ...] = ()
+    short_decoded: str = ""
 
 
 def _ber_tlvs(data: bytes) -> list[tuple[int, bytes]]:
@@ -1231,6 +1232,20 @@ def decode_tar_context_response(name: str, response: APDUResponse) -> tuple[str,
     return ()
 
 
+def summarize_tar_context_response(name: str, response: APDUResponse,
+                                   decoded: Sequence[str]) -> str:
+    """Create a one-line counterpart to the complete context decoding."""
+    if name.startswith("STATUS") and response.sw == 0x9000:
+        wanted = ("File identifier=", "File descriptor=", "Life-cycle status=",
+                  "Available memory=", "PIN status template:")
+        selected = [detail for detail in decoded if detail.startswith(wanted)]
+        return "STATUS OK: " + "; ".join(selected or ("FCP returned but no standard fields decoded",))
+    if name.startswith("GET DATA") and response.sw == 0x6D00:
+        return "GET DATA unavailable for this CLA (6D00); unrelated to TAR/MSL/PoR"
+    info = decode_status_word(response.sw1, response.sw2)
+    return f"{name}: SW={response.sw:04X} ({info.meaning})"
+
+
 def analyze_tar_context_response(name: str, command: bytes,
                                  response: APDUResponse) -> ResponseAnalysis:
     """Interpret STATUS/GET DATA without confusing optional support with TARs."""
@@ -1267,9 +1282,10 @@ def probe_tar_scan_context(transport: CardTransport,
     results = []
     for name, command in commands:
         response, exchanges = _card_command_trace(transport, command)
+        decoded = decode_tar_context_response(name, response)
         results.append(TARContextResult(
             name, command, response, analyze_tar_context_response(name, command, response),
-            exchanges, decode_tar_context_response(name, response)
+            exchanges, decoded, summarize_tar_context_response(name, response, decoded)
         ))
     return results
 
@@ -1453,8 +1469,11 @@ def _run_known_tar_scan(reader: int, keyset: int,
                           f"SW={exchange_response.sw:04X} - {info.meaning}", flush=True)
                 print(f"    ANALYSIS={context.analysis.conclusion}; "
                       f"NEXT={context.analysis.next_step}", flush=True)
-                for detail in context.decoded:
-                    print(f"    DECODE={detail}", flush=True)
+                print(f"    SHORT={context.short_decoded}", flush=True)
+                if context.decoded:
+                    print("    LONG:", flush=True)
+                    for detail in context.decoded:
+                        print(f"      - {detail}", flush=True)
         except Exception as exc:
             errors += 1
             print(f"  Context probe error: {exc}; continuing with TAR probes", flush=True)
@@ -1542,8 +1561,11 @@ def _run_known_tar_scan(reader: int, keyset: int,
               f"DATA={context.response.data.hex().upper() or '<empty>'} "
               f"SEVERITY={context.analysis.severity} - {info.meaning}; "
               f"{context.analysis.conclusion}", flush=True)
-        for detail in context.decoded:
-            print(f"    {detail}", flush=True)
+        print(f"    SHORT: {context.short_decoded}", flush=True)
+        if context.decoded:
+            print("    LONG:", flush=True)
+            for detail in context.decoded:
+                print(f"      - {detail}", flush=True)
     if not context_results:
         print("  unavailable", flush=True)
     print("MSL coverage:", flush=True)
@@ -1876,10 +1898,20 @@ def run_self_tests() -> int:
         assert "Life-cycle status=05 (operational/activated)" in decoded
         assert "Available memory=273872 byte(s)" in decoded
         assert "PIN status template: qualifier=60, references=PIN1,PIN2,ADM1" in decoded
+        short = summarize_tar_context_response(
+            "STATUS current UICC application", APDUResponse(logged_fcp, 0x90, 0x00), decoded
+        )
+        assert short.startswith("STATUS OK:")
+        assert "File identifier=3F00 (MF)" in short
+        assert "Available memory=273872 byte(s)" in short
         get_data = decode_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00)
         )
         assert "optional" in get_data[0] and "unrelated to TAR" in get_data[1]
+        get_data_short = summarize_tar_context_response(
+            "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00), get_data
+        )
+        assert get_data_short == "GET DATA unavailable for this CLA (6D00); unrelated to TAR/MSL/PoR"
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:

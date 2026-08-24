@@ -135,12 +135,15 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the decoded-FCP build reports `uicc-fcp-decode-v3`.
+being executed, and the dual-answer build reports `uicc-short-long-v4`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as
 raw hexadecimal instead of being guessed. Optional GET DATA `6D00` explicitly
 states that INS `CA` is absent for that CLA and is unrelated to TAR/PoR results.
+Each context result now prints both `SHORT`, a one-line operational answer, and
+`LONG`, the complete field-by-field decode. This keeps full ETSI/3GPP evidence
+available without forcing operators to read every TLV during a large TAR scan.
 
 There is nothing to install and no second Python source file. Examples:
 
