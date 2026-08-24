@@ -85,7 +85,7 @@ response-capable profiles plus 20 explicit unsecured SPI1/MSL values:
 The matrix covers counter, checksum, ciphering, and RFU-bit declarations, but
 does not apply real ciphering and uses zero-filled checksum bytes. A TAR is confirmed only when a parseable
 PoR returns the same TAR with an RSC other than `09`; matching RSC `09` is shown
-as `REPORTED UNKNOWN`, and transport-only status words remain `INCONCLUSIVE`.
+as `NOT FOUND ON TESTED ROUTE`, and transport-only status words remain `UNDETERMINED`.
 The menu and `scan-known-tars --single-profile` retain a fast basic-profile mode.
 PoR SPI2 is validated independently of command MSL: bits 1-0 select no PoR,
 always PoR, or error-only PoR; bits 3-2 select no security/RC/CC/DS; bit 4
@@ -93,6 +93,11 @@ selects PoR ciphering; and bit 5 selects SMS-DELIVER-REPORT or SMS-SUBMIT.
 The live log prints this full decode for every probe. Reserved request value
 `11`, RFU bits, contradictory no-PoR options, and attempts to treat an
 SMS-SUBMIT PoR as an ENVELOPE response are rejected.
+For a direct answer, `check-tar` accepts one or more arbitrary three-byte TARs,
+tests them across selected keysets and all response-capable MSL profiles, and
+prints `EXISTS=YES`, `NO`, or `UNKNOWN`. `YES` requires a matching non-`09` PoR;
+`NO` means the tested route explicitly returned unknown-TAR RSC `09`; `UNKNOWN`
+means the card returned no matching PoR, so absence cannot be inferred.
 
 Lower-level packet and automation commands remain available as CLI subcommands.
 Reader discovery and card connection failures are reported as short actionable
@@ -161,7 +166,7 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the current build reports `por-spi2-validation-v10`.
+being executed, and the current build reports `targeted-tar-detection-v11`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as

@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.9"
-BUILD_ID = "por-spi2-validation-v10"
+__version__ = "0.4.0"
+BUILD_ID = "targeted-tar-detection-v11"
 
 
 class PacketError(ValueError):
@@ -176,6 +176,20 @@ def known_tar_keyset_packets(keysets: Iterable[int], groups: Iterable[str] | Non
         for group, packet in known_tar_packets(keyset, groups):
             if wanted is None or packet.tar.hex().upper() in wanted:
                 yield f"{group}/K{keyset}", packet
+
+
+def targeted_tar_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Yield operator-supplied TAR candidates across selected keysets."""
+    normalized = tuple(value.strip().upper() for value in tars)
+    for value in normalized:
+        try:
+            tar = bytes.fromhex(value)
+        except ValueError as exc:
+            raise PacketError(f"invalid TAR hexadecimal value {value!r}") from exc
+        if len(tar) != 3:
+            raise PacketError(f"TAR {value!r} must be exactly three bytes")
+        for keyset in keysets:
+            yield f"TARGET/K{keyset}", CommandPacket(tar, keyset=keyset, user_data=b"\0" * 5)
 
 
 def _tlv(tag: int, value: bytes) -> bytes:
@@ -1686,6 +1700,7 @@ def analyze_fuzzer_response_patterns(
 class TARExistenceAssessment:
     tar: str
     state: str
+    exists: bool | None
     evidence: str
     profiles_tried: int
     keysets_tried: tuple[int, ...]
@@ -1699,7 +1714,9 @@ def assess_tar_existence(
     A parseable PoR with a matching TAR and any RSC other than ``09`` proves
     that routing reached the target/security domain, even when its MSL rejected
     the command. RSC ``09`` is an explicit unknown-TAR report. Transport status
-    words alone are deliberately inconclusive.
+    words alone are deliberately inconclusive. ``exists=False`` means the card
+    explicitly reported unknown TAR for the tested bearer/keysets; it is not a
+    claim about a different application, security domain, or OTA bearer.
     """
     grouped: dict[str, list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]]] = {}
     for result in results:
@@ -1713,19 +1730,22 @@ def assess_tar_existence(
         profiles = len({row[0].rsplit("/K", 1)[0].split("/", 1)[-1] for row in rows})
         if present:
             codes = sorted({row[4].status_code for row in present})
-            state = "CONFIRMED PRESENT"
+            state = "EXISTS ON CARD"
+            exists = True
             evidence = (f"matching PoR received with RSC={','.join(f'{code:02X}' for code in codes)}; "
                         "the TAR was reached even if its security policy rejected the command")
         elif unknown:
-            state = "REPORTED UNKNOWN"
+            state = "NOT FOUND ON TESTED ROUTE"
+            exists = False
             evidence = (f"{len(unknown)} matching PoR(s) returned RSC=09 (unknown TAR); "
                         "not found under the tested keysets/MSL profiles")
         else:
             mismatched = sum(row[4] is not None for row in rows)
-            state = "INCONCLUSIVE"
+            state = "UNDETERMINED"
+            exists = None
             evidence = ("no parseable matching PoR; APDU 9000/62xx/6F00 only confirms transport behavior"
                         + (f"; ignored {mismatched} PoR(s) with a different/missing TAR" if mismatched else ""))
-        assessments.append(TARExistenceAssessment(tar, state, evidence, profiles, keysets))
+        assessments.append(TARExistenceAssessment(tar, state, exists, evidence, profiles, keysets))
     return tuple(assessments)
 
 
@@ -1854,7 +1874,8 @@ def _run_scan(reader: int, level2: bool) -> None:
 def _run_known_tar_scan(reader: int, keyset: int,
                         groups: Iterable[str] | None = None,
                         probes: Iterable[tuple[str, CommandPacket]] | None = None,
-                        title: str = "KNOWN TAR SCAN", *, force_por: bool = True) -> None:
+                        title: str = "KNOWN TAR SCAN", *, force_por: bool = True
+                        ) -> tuple[TARExistenceAssessment, ...]:
     """Deliver the known TAR corpus over SMS-PP and summarize card responses."""
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
@@ -2037,6 +2058,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
         print(f"  - TAR={item.tar} STATE={item.state} PROFILES={item.profiles_tried} "
               f"KEYSETS={keysets} - {item.evidence}", flush=True)
     print("============================================", flush=True)
+    return assessments
 
 
 @dataclass(frozen=True)
@@ -2412,9 +2434,20 @@ def run_self_tests() -> int:
              APDUResponse(b"", 0x62, 0), None),
         ]
         existence = {item.tar: item for item in assess_tar_existence(existence_rows)}
-        assert existence["B00010"].state == "CONFIRMED PRESENT"
-        assert existence["000000"].state == "REPORTED UNKNOWN"
-        assert existence["505348"].state == "INCONCLUSIVE"
+        assert existence["B00010"].state == "EXISTS ON CARD" and existence["B00010"].exists is True
+        assert existence["000000"].state == "NOT FOUND ON TESTED ROUTE" and existence["000000"].exists is False
+        assert existence["505348"].state == "UNDETERMINED" and existence["505348"].exists is None
+
+        targets = list(targeted_tar_packets(("b00010", "505348"), (1, 3)))
+        assert len(targets) == 4
+        assert {packet.tar.hex().upper() for _, packet in targets} == {"B00010", "505348"}
+        assert {packet.keyset for _, packet in targets} == {1, 3}
+        try:
+            list(targeted_tar_packets(("B001",), (1,)))
+        except PacketError:
+            pass
+        else:
+            raise AssertionError("short targeted TAR accepted")
 
     @check("combined ATR index, forced PoR and TAR context probes")
     def _tar_scan_intelligence() -> None:
@@ -2715,12 +2748,18 @@ def interactive_menu() -> int:
                 _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
                                     title="STANDARD FUZZING", force_por=False)
             elif choice == "2":
-                mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
+                mode = input("Known corpus, TAR list, or hexadecimal range? [known/target/range]: ").strip().lower() or "known"
                 entered_keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
                 keysets = tuple(int(value) for value in
                                 (entered_keysets or ",".join(map(str, POPULAR_KEYSETS))).split(","))
                 all_msl = input("Test all response-capable MSL profiles? [Y/n]: ").strip().lower() != "n"
-                if mode == "range":
+                if mode == "target":
+                    entered_tars = input("TARs comma-separated [B00010]: ").strip() or "B00010"
+                    reader = _select_reader()
+                    base_probes = targeted_tar_packets(entered_tars.split(","), keysets)
+                    probes = tar_msl_probe_packets(base_probes) if all_msl else base_probes
+                    _run_known_tar_scan(reader, keysets[0], probes=probes, title="TARGETED TAR CHECK")
+                elif mode == "range":
                     low = _read_int("First TAR hex [000000]: ", base=16)
                     high = _read_int("Last TAR hex [0000FF]: ", 0xFF, 16)
                     reader = _select_reader()
@@ -2780,6 +2819,13 @@ def make_parser() -> argparse.ArgumentParser:
     known_scan.add_argument("--popular-only", action="store_true")
     known_scan.add_argument("--single-profile", action="store_true",
                             help="use only the basic MSL=0 profile instead of all response-capable MSL profiles")
+    check_tar = commands.add_parser("check-tar", help="check whether specific TARs exist on a card")
+    check_tar.add_argument("tars", nargs="+", help="three-byte hexadecimal TAR values")
+    check_tar.add_argument("--reader", type=int, default=0)
+    check_tar.add_argument("--keyset", type=int, help="single keyset")
+    check_tar.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
+    check_tar.add_argument("--single-profile", action="store_true",
+                           help="use only basic MSL=0 instead of the complete response-capable matrix")
     commands.add_parser("menu")
     commands.add_parser("self-test")
     return parser
@@ -2819,6 +2865,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         probes = base_probes if args.single_profile else tar_msl_probe_packets(base_probes)
         _run_known_tar_scan(args.reader, keysets[0], probes=probes,
                             title="POPULAR TAR SCAN" if args.popular_only else "KNOWN TAR SCAN")
+    elif args.command == "check-tar":
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        base_probes = targeted_tar_packets(args.tars, keysets)
+        probes = base_probes if args.single_profile else tar_msl_probe_packets(base_probes)
+        assessments = _run_known_tar_scan(args.reader, keysets[0], probes=probes,
+                                          title="TARGETED TAR CHECK")
+        print("\nTARGETED RESULT:")
+        for item in assessments:
+            answer = "YES" if item.exists is True else "NO" if item.exists is False else "UNKNOWN"
+            print(f"  TAR={item.tar} EXISTS={answer} - {item.evidence}")
     return 0
 
 
