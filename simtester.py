@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import time
+import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
@@ -36,6 +38,8 @@ class CommandPacket:
     fake_spi2: int | None = None
     fake_kic: int | None = None
     fake_kid: int | None = None
+    cryptographic_checksum: bool = False
+    ciphering: bool = False
 
     HEADER = b"\x02\x70\x00"
 
@@ -60,7 +64,9 @@ class CommandPacket:
 
     @property
     def spi1(self) -> int:
-        return (self.counter_management & 3) << 3
+        return ((self.counter_management & 3) << 3
+                | (0x02 if self.cryptographic_checksum else 0)
+                | (0x04 if self.ciphering else 0))
 
     @property
     def spi2(self) -> int:
@@ -80,8 +86,10 @@ class CommandPacket:
         spi2 = self.spi2 if self.fake_spi2 is None else self.fake_spi2
         kic = self.kic if self.fake_kic is None else self.keyset << 4 | self.fake_kic & 15
         kid = self.kid if self.fake_kid is None else self.keyset << 4 | self.fake_kid & 15
-        body = (bytes((13, spi1, spi2, kic, kid)) + self.tar
-                + self.counter.to_bytes(5, "big") + b"\0" + self.user_data)
+        checksum = b"\0" * 8 if self.cryptographic_checksum else b""
+        header_length = 13 + len(checksum)
+        body = (bytes((header_length, spi1, spi2, kic, kid)) + self.tar
+                + self.counter.to_bytes(5, "big") + b"\0" + checksum + self.user_data)
         return self.HEADER + len(body).to_bytes(2, "big") + body
 
     @classmethod
@@ -90,17 +98,21 @@ class CommandPacket:
             raise PacketError("command packet header missing or packet too short")
         if int.from_bytes(data[3:5], "big") != len(data) - 5:
             raise PacketError("CPL does not match packet length")
-        if data[5] != 13:
-            raise PacketError("only non-checksummed command headers are supported")
+        if data[5] not in (13, 21):
+            raise PacketError("command header length must be 13 or 21")
         spi1, spi2, kic, kid = data[6:10]
         reverse = {0: 0, 1: 1, 5: 2, 9: 3, 13: 4}
         if kic >> 4 != kid >> 4:
             raise PacketError("KIC and KID keysets differ")
         if kic & 15 not in reverse or kid & 15 not in reverse:
             raise PacketError("unknown KIC/KID algorithm")
-        return cls(data[10:13], kic >> 4, int.from_bytes(data[13:18], "big"), data[19:],
+        checksum_present = data[5] == 21
+        user_offset = 27 if checksum_present else 19
+        return cls(data[10:13], kic >> 4, int.from_bytes(data[13:18], "big"), data[user_offset:],
                    (spi1 >> 3) & 3, reverse[kic & 15], reverse[kid & 15],
-                   (spi2 & 3) == 1, bool(spi2 & 0x10), bool(spi2 & 0x20))
+                   (spi2 & 3) == 1, bool(spi2 & 0x10), bool(spi2 & 0x20),
+                   cryptographic_checksum=checksum_present or bool(spi1 & 2),
+                   ciphering=bool(spi1 & 4))
 
 
 # Curated probe corpus retained from SIMTester. "RFM" contains common remote
@@ -172,9 +184,10 @@ def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iter
         for keyset in keysets:
             for index, (counter, kic, kid, por, cipher_por) in enumerate(FUZZER_PROFILES):
                 yield f"F{index:02d}/K{keyset}", CommandPacket(
-                    tar_bytes, keyset, user_data=b"\0" * 5,
+                    tar_bytes, keyset, counter=0 if counter == 0 else 1, user_data=b"\0" * 5,
                     counter_management=counter, kic_algorithm=kic,
                     kid_algorithm=kid, request_por=por, cipher_por=cipher_por,
+                    cryptographic_checksum=kid != 0, ciphering=kic != 0,
                 )
 
 
@@ -234,6 +247,29 @@ class ResponsePacket:
     @property
     def has_additional_data(self) -> bool:
         return bool(self.additional_data)
+
+
+def requested_msl(packet: CommandPacket) -> str:
+    protections = []
+    if packet.cryptographic_checksum:
+        protections.append("CC")
+    if packet.ciphering:
+        protections.append("ciphering")
+    if packet.counter_management:
+        protections.append(f"counter-mode-{packet.counter_management}")
+    return "MSL=0 (no command security)" if not protections else "MSL>0 (" + ", ".join(protections) + ")"
+
+
+def decode_por_status(status: int) -> str:
+    meanings = {
+        0x00: "PoR success", 0x01: "RC/CC/DS failed", 0x02: "counter too low",
+        0x03: "counter too high", 0x04: "counter blocked", 0x05: "ciphering error",
+        0x06: "unidentified security error", 0x07: "insufficient memory",
+        0x08: "more time needed", 0x09: "unknown TAR", 0x0A: "insufficient security",
+        0x0B: "application data format error", 0x0C: "application error",
+        0x0D: "unknown error",
+    }
+    return meanings.get(status, "vendor-specific PoR status")
 
 
 @dataclass(frozen=True)
@@ -501,11 +537,70 @@ VENDOR_MARKERS = (
     (b"VALID", "Valid"), (b"SYSMO", "sysmocom"),
 )
 
+ATR_DATABASE_URL = "https://pcsc-tools.apdu.fr/smartcard_list.txt"
+_ATR_DATABASE_CACHE: tuple[str | None, str] | None = None
+
+
+def load_atr_database() -> tuple[str | None, str]:
+    """Load Ludovic Rousseau's public pcsc-tools ATR database or a local copy."""
+    global _ATR_DATABASE_CACHE
+    if _ATR_DATABASE_CACHE is not None:
+        return _ATR_DATABASE_CACHE
+    local_path = os.environ.get("SIMTESTER_ATR_DATABASE")
+    try:
+        if local_path:
+            with open(local_path, "r", encoding="utf-8", errors="replace") as database:
+                text = database.read()
+            source = local_path
+        else:
+            with urllib.request.urlopen(ATR_DATABASE_URL, timeout=4) as response:
+                text = response.read().decode("utf-8", "replace")
+            source = ATR_DATABASE_URL
+        _ATR_DATABASE_CACHE = text, source
+    except Exception as exc:
+        _ATR_DATABASE_CACHE = None, f"unavailable ({exc}); set SIMTESTER_ATR_DATABASE to a local copy"
+    return _ATR_DATABASE_CACHE
+
+
+def lookup_atr_database(atr: bytes, database_text: str | None) -> list[str]:
+    """Return descriptions matching exact or `..` wildcard ATR database entries."""
+    if not database_text or not atr:
+        return []
+    target = atr.hex().upper()
+    matches: list[str] = []
+    lines = database_text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        pattern = "".join(stripped.split()).upper()
+        if not pattern.startswith(("3B", "3F")) or len(pattern) != len(target):
+            continue
+        if not all(pattern[pos:pos + 2] in ("..", "??", target[pos:pos + 2])
+                   for pos in range(0, len(target), 2)):
+            continue
+        descriptions = []
+        for following in lines[index + 1:]:
+            if following and not following[0].isspace():
+                break
+            description = following.strip()
+            if description and not description.startswith("#"):
+                descriptions.append(description)
+        matches.extend(descriptions or [stripped])
+    return matches
+
 
 def detect_sim_vendor(atr: bytes, manufacturer_area: bytes | None,
-                      gemxpresso_file: bool = False) -> tuple[str, str]:
+                      gemxpresso_file: bool = False,
+                      atr_database_text: str | None = None) -> tuple[str, str]:
     """Conservative vendor match using public ATR text markers and vendor files."""
     evidence = atr.upper() + b" " + (manufacturer_area or b"").upper()
+    database_matches = lookup_atr_database(atr, atr_database_text)
+    if database_matches:
+        description = " | ".join(database_matches[:3])
+        upper_description = description.upper().encode("ascii", "ignore")
+        for marker, vendor in VENDOR_MARKERS:
+            if marker in upper_description:
+                return vendor, f"pcsc-tools ATR database: {description}"
+        return description, f"matched pcsc-tools ATR database ({ATR_DATABASE_URL})"
     for marker, vendor in VENDOR_MARKERS:
         if marker in evidence:
             return vendor, f"matched marker {marker.decode('ascii')} in ATR/manufacturer data"
@@ -629,7 +724,8 @@ def _credential_status(transport: CardTransport, apdu_format: APDUFormat,
 
 
 def collect_sim_summary(transport: CardTransport,
-                        apdu_format: APDUFormat | None = None) -> dict[str, str]:
+                        apdu_format: APDUFormat | None = None,
+                        use_atr_database: bool = True) -> dict[str, str]:
     """Best-effort read of common subscriber identity files."""
     summary = {"ATR": "unavailable", "ICCID": "unavailable", "IMSI": "unavailable",
                "MSISDN": "unavailable", "SPN": "unavailable", "SIM vendor": "unknown"}
@@ -668,7 +764,13 @@ def collect_sim_summary(transport: CardTransport,
             summary["Manufacturer area"] = manufacturer.hex().upper()
         gemxpresso = _file_exists(transport, (0x3F00, 0x5F11))
         atr_value = bytes.fromhex(summary["ATR"]) if summary["ATR"] != "unavailable" else b""
-        vendor, evidence = detect_sim_vendor(atr_value, manufacturer, gemxpresso)
+        database_text, database_source = load_atr_database() if use_atr_database else (None, "disabled")
+        summary["ATR database source"] = database_source
+        database_matches = lookup_atr_database(atr_value, database_text)
+        summary["ATR database match"] = " | ".join(database_matches[:3]) if database_matches else "none"
+        vendor, evidence = detect_sim_vendor(
+            atr_value, manufacturer, gemxpresso, database_text
+        )
         summary["SIM vendor"] = vendor
         summary["Vendor evidence"] = evidence
         if apdu_format is not None:
@@ -916,7 +1018,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     probe_list = list(known_tar_packets(keyset, groups) if probes is None else probes)
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
-    results: list[tuple[str, str, APDUResponse, ResponsePacket | None]] = []
+    results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
     errors = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keyset {keyset}", flush=True)
@@ -962,33 +1064,51 @@ def _run_known_tar_scan(reader: int, keyset: int,
             except PacketError:
                 pass
             ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
+            por = f" ({decode_por_status(parsed.status_code)})" if parsed is not None else ""
             print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} RX "
                   f"DATA={data.hex().upper() or '<empty>'} SW={response.sw:04X}{ota} "
-                  f"- {info.meaning}", flush=True)
-            results.append((group, tar, response, parsed))
+                  f"{por} - {info.meaning}; {requested_msl(packet)}", flush=True)
+            results.append((group, tar, packet, response, parsed))
     finally:
         print_sim_summary(transport, apdu_format)
         try:
             transport.close()
         except Exception:
             pass
-    parsed_results = [result for result in results if result[3] is not None]
+    parsed_results = [result for result in results if result[4] is not None]
     interesting_results = [
         result for result in results
-        if result[3] is not None or result[2].data
-        or result[2].sw not in (0x9000, 0x6D00, 0x6E00)
+        if result[4] is not None or result[3].data
+        or result[3].sw not in (0x9000, 0x6D00, 0x6E00)
     ]
+    insecure = [result for result in parsed_results
+                if result[4].status_code == 0 and requested_msl(result[2]).startswith("MSL=0")]
+    por_requested = sum(1 for result in results if result[2].request_por)
+    por_received = sum(1 for result in parsed_results if result[2].request_por)
+    msl_attempts = Counter(requested_msl(result[2]) for result in results)
+    msl_successes = Counter(requested_msl(result[2]) for result in parsed_results
+                            if result[4].status_code == 0)
     print(f"\n========== {title} SUMMARY ==========", flush=True)
     print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
+    print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
+    print("MSL coverage:", flush=True)
+    for level, attempts in msl_attempts.items():
+        print(f"  {level}: responses={attempts}, successful-PoR={msl_successes[level]}", flush=True)
+    if insecure:
+        print(f"WARNING: {len(insecure)} UNSECURE MSL=0 command(s) succeeded", flush=True)
     print(f"Interesting findings: {len(interesting_results)}", flush=True)
-    for group, tar, response, parsed in interesting_results:
+    for group, tar, packet, response, parsed in interesting_results:
         info = decode_status_word(response.sw1, response.sw2)
-        ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
+        ota = (f" OTA-RSC={parsed.status_code:02X}({decode_por_status(parsed.status_code)})"
+               if parsed is not None else " no-PoR")
+        warning = " WARNING=UNSECURE" if (parsed is not None and parsed.status_code == 0
+                                          and requested_msl(packet).startswith("MSL=0")) else ""
         print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
-              f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
+              f"DATA={response.data.hex().upper() or '<empty>'} {requested_msl(packet)}"
+              f"{warning} - {info.meaning}", flush=True)
     if not interesting_results:
         print("  None", flush=True)
     print("============================================", flush=True)
@@ -1111,6 +1231,9 @@ def run_self_tests() -> int:
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain
+        assert requested_msl(packets[0][1]) == "MSL=0 (no command security)"
+        assert "CC" in requested_msl(packets[5][1])
+        assert "ciphering" in requested_msl(packets[13][1])
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
@@ -1196,7 +1319,9 @@ def run_self_tests() -> int:
                 }
                 return APDUResponse(files.get(self.selected, b""), 0x90, 0)
 
-        summary = collect_sim_summary(SummaryCard(), APDUFormat("3G/UICC", True, 0, 0x80))
+        summary = collect_sim_summary(
+            SummaryCard(), APDUFormat("3G/UICC", True, 0, 0x80), use_atr_database=False
+        )
         assert summary["ATR"] == "3B00"
         assert summary["ATR convention"] == "direct" and summary["ATR protocols"] == "T=0"
         assert summary["APDU format"] == "3G/UICC"
@@ -1214,6 +1339,10 @@ def run_self_tests() -> int:
         assert fast["ATR PPS request"] == "FF10947B"
         vendor = detect_sim_vendor(b"3B GEMALTO", None)
         assert vendor[0] == "Gemalto/Thales"
+        database = "3B 10 ..\n\tGemalto test UICC\n\n3F 00\n\tOther card\n"
+        assert lookup_atr_database(bytes.fromhex("3B1094"), database) == ["Gemalto test UICC"]
+        db_vendor = detect_sim_vendor(bytes.fromhex("3B1094"), None, atr_database_text=database)
+        assert db_vendor[0] == "Gemalto/Thales"
 
     @check("PIN2 and PUK2 fall back from UICC to classic references")
     def _credential_fallback() -> None:

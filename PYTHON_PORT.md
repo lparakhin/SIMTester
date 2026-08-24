@@ -92,6 +92,11 @@ classic SIM forms. The detected 3G (`00`/`80`) or 2G (`A0`) CLA format is then
 used automatically for ENVELOPE and GET RESPONSE commands.
 Scan summaries list only interesting findings; repetitive filtered status words
 remain visible in the live log but are omitted from the final findings section.
+ATR identity/vendor lookup uses the public pcsc-tools database at
+`https://pcsc-tools.apdu.fr/smartcard_list.txt`; set `SIMTESTER_ATR_DATABASE`
+to an updated local copy for offline use. Standard fuzzing reports coverage for
+every requested MSL combination, PoR support, decoded PoR status, and a prominent
+warning whenever an MSL=0 command succeeds without command security.
 
 There is nothing to install and no second Python source file. Examples:
 

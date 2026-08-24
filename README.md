@@ -17,6 +17,7 @@
 > ATR protocol details and supported CLAs are decoded; final summaries retain only findings.
 > PPS speed, conservative SIM-vendor evidence, and PIN/PUK status are also reported.
 > PIN2/PUK2 status automatically falls back across UICC and classic SIM references.
+> ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
 
 SIMTester assess SIM card security in two dimensions:
 
