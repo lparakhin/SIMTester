@@ -26,9 +26,11 @@
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; dual-answer scans identify build `uicc-short-long-v4`.
+> Use `python simtester.py --version`; dual-answer scans identify build `uicc-compact-expanded-v5`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
-> Every STATUS/GET DATA result includes both a one-line SHORT and field-level LONG answer.
+> Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
+> field-level decode with the raw response retained for auditing. UICC GET DATA
+> uses the ETSI `80 CA` command class and decodes card-recognition template `66`.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:
