@@ -1,5 +1,25 @@
 # SIMTester
 
+> **Python implementation:** A dependency-light clean-room port of the packet
+> codecs, transport abstraction, TAR generation, and APDU scanner is combined in
+> the single `simtester.py` script. Run `python simtester.py` for an interactive
+> menu or `python simtester.py self-test` for its built-in tests. No installation
+> or additional Python source files are required. See [PYTHON_PORT.md](PYTHON_PORT.md).
+> APDU scans display every command and response on screen as they run.
+> At the end, they print decoded ETSI/3GPP status words and a complete findings summary.
+> `61xx` is followed with GET RESPONSE, and known S@T/WIB/vendor TAR probe packets
+> can be scanned from menu option 2 or `scan-known-tars` (`known-tars` previews them).
+> The interactive menu is limited to four workflows: standard fuzzing, TAR scanning,
+> APDU scanning, and OTA fuzzing.
+> Each workflow displays a named SIM-reader selection menu before connecting.
+> Every scan ends with a best-effort ATR, ICCID, IMSI, MSISDN, and SPN summary.
+> The card's classic 2G SIM or modern 3G/UICC APDU format is detected automatically.
+> ATR protocol details and supported CLAs are decoded; final summaries retain only findings.
+> PPS speed, conservative SIM-vendor evidence, and PIN/PUK status are also reported.
+> PIN2/PUK2 status automatically falls back across UICC and classic SIM references.
+> ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
+> EFTLab's ATR list is a second source, and SW analysis adds severity and next-step guidance.
+
 SIMTester assess SIM card security in two dimensions:
 
 - **Cryptanalytic attack surface**: Collect cryptographic signatures and encryptions of known plaintexts
