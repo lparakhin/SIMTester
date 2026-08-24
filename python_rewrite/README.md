@@ -1,8 +1,12 @@
-# Python Rewrite (Single-file tools + startup menu)
+# SIMTester single-script tool
 
-All SIMTester tools are combined in:
+The Python implementation is intentionally kept in one executable script:
 
 - `python_rewrite/simtester_tools.py`
+
+There are no generated package skeletons, compatibility modules, or separate
+runtime helpers. APDU transport, response decoding, TAR/OTA packet construction,
+scanners, CSV output, the interactive menu, and the CLI all live in this file.
 
 ## Real reader mode (default)
 
@@ -10,15 +14,15 @@ The tool now attempts **real PC/SC SIM reader scanning** by default via `pyscard
 If real reader initialization fails, the command fails unless you explicitly allow fallback:
 
 ```bash
-python3 -m python_rewrite.simtester_tools --allow-dummy apdu --readers "Reader Name"
+python3 python_rewrite/simtester_tools.py --allow-dummy apdu --readers "Reader Name"
 ```
 
 ## Startup menu before scan
 
 ```bash
-python3 -m python_rewrite.simtester_tools
+python3 python_rewrite/simtester_tools.py
 # or
-python3 -m python_rewrite.simtester_tools --menu
+python3 python_rewrite/simtester_tools.py --menu
 ```
 
 Menu includes:
@@ -36,7 +40,7 @@ During scans, APDU responses are printed on-screen and decoded into human-readab
 ## Reader listing
 
 ```bash
-python3 -m python_rewrite.simtester_tools --list-readers
+python3 python_rewrite/simtester_tools.py --list-readers
 ```
 
 
@@ -67,7 +71,7 @@ TAR scan output now includes human family labels (e.g., WIB family detected, S@T
 For TAR scans you can test multiple well-known keysets in one run using `--keysets`, for example:
 
 ```bash
-python3 -m python_rewrite.simtester_tools --allow-dummy tar --mode scanWellKnownTARs --keysets 1,3,5
+python3 python_rewrite/simtester_tools.py --allow-dummy tar --mode scanWellKnownTARs --keysets 1,3,5
 ```
 
 
