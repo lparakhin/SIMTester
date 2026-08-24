@@ -84,6 +84,9 @@ PPS request. Vendor detection conservatively matches public ATR/manufacturer
 text signatures and the vendor-specific GemXpresso `5F11` directory, always
 showing its evidence or `unknown`. Zero-data status queries report PIN1, PIN2,
 PUK1, and PUK2 availability, blocking state, and remaining attempts when given.
+PIN2/PUK2 queries first use the detected generation's reference (`81` for UICC,
+`02` for classic SIM), then safely fall back across both references and `00`/`A0`
+CLA formats when the card returns wrong-parameter or unsupported-format status.
 Before scanning, the selected card is probed with SELECT MF in modern UICC and
 classic SIM forms. The detected 3G (`00`/`80`) or 2G (`A0`) CLA format is then
 used automatically for ENVELOPE and GET RESPONSE commands.

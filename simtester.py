@@ -579,23 +579,53 @@ def _file_exists(transport: CardTransport, path: Sequence[int]) -> bool:
 
 
 def _credential_status(transport: CardTransport, apdu_format: APDUFormat,
-                       instruction: int, reference: int) -> str:
-    command = bytes((apdu_format.select_cla, instruction, 0, reference))
-    try:
-        response = transport.transmit(command)
-    except Exception as exc:
-        return f"unavailable ({exc})"
+                       instruction: int, references: Sequence[int]) -> str:
+    """Query PIN/PUK state, falling back across UICC and classic SIM formats."""
+    preferred_cla = apdu_format.select_cla
+    clas = (preferred_cla, 0xA0 if preferred_cla == 0 else 0x00)
+    rejected: list[str] = []
+    response = None
+    used_cla = preferred_cla
+    used_reference = references[0]
+    for cla in clas:
+        for reference in references:
+            command = bytes((cla, instruction, 0x00, reference))
+            try:
+                candidate = transport.transmit(command)
+            except Exception as exc:
+                rejected.append(f"CLA={cla:02X}/REF={reference:02X}: {exc}")
+                continue
+            # Wrong P1/P2, CLA, INS, or APDU length means this credential
+            # addressing form is unsupported; transparently try the next one.
+            if candidate.sw in (0x6700, 0x6A86, 0x6B00, 0x6D00, 0x6E00):
+                rejected.append(f"CLA={cla:02X}/REF={reference:02X}: SW={candidate.sw:04X}")
+                continue
+            response = candidate
+            used_cla = cla
+            used_reference = reference
+            break
+        if response is not None:
+            break
+    if response is None:
+        details = "; ".join(rejected) or "no response"
+        return f"not reported ({details})"
+    addressing = f" [CLA={used_cla:02X}, REF={used_reference:02X}]"
     if response.sw == 0x9000:
-        return "enabled and already verified"
+        return "enabled and already verified" + addressing
     if response.sw1 == 0x63 and response.sw2 & 0xF0 == 0xC0:
-        return f"enabled, {response.sw2 & 15} attempts remaining"
+        return f"enabled, {response.sw2 & 15} attempts remaining" + addressing
     if response.sw in (0x6983, 0x9840):
-        return "blocked"
+        return "blocked" + addressing
+    if response.sw == 0x9804:
+        return "enabled, attempts remaining not reported" + addressing
+    if response.sw == 0x9802:
+        return "not initialized" + addressing
     if response.sw in (0x6985, 0x9808):
-        return "disabled, already satisfied, or status contradiction"
+        return "disabled, already satisfied, or status contradiction" + addressing
     if response.sw in (0x6A88, 0x9404):
-        return "not available"
-    return f"not reported (SW={response.sw:04X}: {decode_status_word(response.sw1, response.sw2).meaning})"
+        return "not available" + addressing
+    return (f"not reported (SW={response.sw:04X}: "
+            f"{decode_status_word(response.sw1, response.sw2).meaning})" + addressing)
 
 
 def collect_sim_summary(transport: CardTransport,
@@ -642,13 +672,13 @@ def collect_sim_summary(transport: CardTransport,
         summary["SIM vendor"] = vendor
         summary["Vendor evidence"] = evidence
         if apdu_format is not None:
-            pin2_reference = 0x81 if apdu_format.third_gen else 0x02
-            summary["PIN1 status"] = _credential_status(transport, apdu_format, 0x20, 0x01)
-            summary["PIN2 status"] = _credential_status(transport, apdu_format, 0x20, pin2_reference)
+            pin2_references = (0x81, 0x02) if apdu_format.third_gen else (0x02, 0x81)
+            summary["PIN1 status"] = _credential_status(transport, apdu_format, 0x20, (0x01,))
+            summary["PIN2 status"] = _credential_status(transport, apdu_format, 0x20, pin2_references)
             # A zero-data RESET RETRY COUNTER is the standardized status query;
             # it does not submit a PUK and therefore does not consume an attempt.
-            summary["PUK1 status"] = _credential_status(transport, apdu_format, 0x2C, 0x01)
-            summary["PUK2 status"] = _credential_status(transport, apdu_format, 0x2C, pin2_reference)
+            summary["PUK1 status"] = _credential_status(transport, apdu_format, 0x2C, (0x01,))
+            summary["PUK2 status"] = _credential_status(transport, apdu_format, 0x2C, pin2_references)
     except Exception as exc:
         summary["Read status"] = f"partial ({exc})"
     return summary
@@ -1175,7 +1205,7 @@ def run_self_tests() -> int:
         assert summary["IMSI"] == "234567890123456"
         assert summary["MSISDN"] == "+1234567890"
         assert summary["SPN"] == "Carrier"
-        assert summary["PIN1 status"] == "enabled and already verified"
+        assert summary["PIN1 status"] == "enabled and already verified [CLA=00, REF=01]"
         assert summary["SIM vendor"] == "unknown"
         t1 = decode_atr(bytes.fromhex("3B800181"))
         assert t1["ATR protocols"] == "T=1" and t1["ATR TCK"] == "81"
@@ -1184,6 +1214,25 @@ def run_self_tests() -> int:
         assert fast["ATR PPS request"] == "FF10947B"
         vendor = detect_sim_vendor(b"3B GEMALTO", None)
         assert vendor[0] == "Gemalto/Thales"
+
+    @check("PIN2 and PUK2 fall back from UICC to classic references")
+    def _credential_fallback() -> None:
+        commands: list[bytes] = []
+
+        def handler(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu[3] == 0x81:
+                return APDUResponse(b"", 0x6B, 0x00)
+            return APDUResponse(b"", 0x63, 0xC7 if apdu[1] == 0x20 else 0xCA)
+
+        card = MockTransport(handler)
+        card_format = APDUFormat("3G/UICC", True, 0, 0x80)
+        pin2 = _credential_status(card, card_format, 0x20, (0x81, 0x02))
+        puk2 = _credential_status(card, card_format, 0x2C, (0x81, 0x02))
+        assert pin2 == "enabled, 7 attempts remaining [CLA=00, REF=02]"
+        assert puk2 == "enabled, 10 attempts remaining [CLA=00, REF=02]"
+        assert commands == [bytes.fromhex("00200081"), bytes.fromhex("00200002"),
+                            bytes.fromhex("002C0081"), bytes.fromhex("002C0002")]
 
     failures = 0
     for name, function in checks:

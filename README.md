@@ -16,6 +16,7 @@
 > The card's classic 2G SIM or modern 3G/UICC APDU format is detected automatically.
 > ATR protocol details and supported CLAs are decoded; final summaries retain only findings.
 > PPS speed, conservative SIM-vendor evidence, and PIN/PUK status are also reported.
+> PIN2/PUK2 status automatically falls back across UICC and classic SIM references.
 
 SIMTester assess SIM card security in two dimensions:
 
