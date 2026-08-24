@@ -158,7 +158,8 @@ This is classified as evidence that a different UICC parser path was reached,
 not as evidence that the secured command executed or that a TAR is unprotected.
 Every TAR probe now requests PoR, including caller-supplied packets that omitted
 the request bit. Before delivery, the TAR workflow sends the generation-specific
-ETSI UICC/SIM STATUS command and an optional ISO GET DATA card-recognition probe,
+ETSI UICC/SIM STATUS command and optional card-recognition GET DATA probes using
+both ISO CLA `00` and the detected UICC/SIM telecom CLA (`80`/`A0`),
 follows `61xx`, `9Fxx`, and `6Cxx`, and logs every initial and corrected exchange.
 `6D00` from optional GET DATA is reported as a context capability result rather
 than evidence against OTA support. Repeated empty `62xx` replies are collapsed
@@ -166,14 +167,15 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the current build reports `targeted-tar-detection-v11`.
+being executed, and the current build reports `get-data-cla-fallback-v12`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as
 raw hexadecimal instead of being guessed. Output provides COMPACT and EXPANDED
 views, and successful GET DATA card-recognition responses decode template `66`
-and its known fields while retaining unknown tags. Optional GET DATA `6D00` explicitly
-states that INS `CA` is absent for that CLA and is unrelated to TAR/PoR results.
+and its known fields while retaining unknown tags. A `6D00` or `6E00` response
+is reported together with every CLA attempted; it means that specific format is
+unsupported and remains unrelated to TAR/PoR results.
 Each context result now prints both `COMPACT`, a one-line operational answer, and
 `EXPANDED`, the raw response plus complete field-by-field decode. This keeps full ETSI/3GPP evidence
 available without forcing operators to read every TLV during a large TAR scan.
