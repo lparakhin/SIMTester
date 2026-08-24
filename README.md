@@ -26,7 +26,7 @@
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; current scans identify build `unsecured-msl-matrix-v9`.
+> Use `python simtester.py --version`; current scans identify build `por-spi2-validation-v10`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
 > Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
 > field-level decode with the raw response retained for auditing. UICC GET DATA
@@ -45,6 +45,11 @@
 > `00,01,02,04,05,06,08,09,0A,0C,0D,0E,10,11,14,15,18,19,1C,1D`.
 > CC bytes are zero-filled and declared ciphering is not applied, so these are
 > clearly labeled detection probes rather than genuinely secured commands.
+> PoR requests are encoded and logged from SPI2 per 3GPP TS 31.115 / ETSI
+> TS 102 225: request policy (`00`, `01`, or `10`), RC/CC/DS protection,
+> ciphering, and SMS-DELIVER-REPORT versus SMS-SUBMIT response mode. Reserved
+> request/RFU combinations are rejected, and SMS-SUBMIT is never counted as an
+> ENVELOPE-response PoR. GSMA UICC/eSIM deployments reuse these OTA mechanisms.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:

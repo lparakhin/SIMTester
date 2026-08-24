@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.8"
-BUILD_ID = "unsecured-msl-matrix-v9"
+__version__ = "0.3.9"
+BUILD_ID = "por-spi2-validation-v10"
 
 
 class PacketError(ValueError):
@@ -43,6 +43,8 @@ class CommandPacket:
     fake_kid: int | None = None
     cryptographic_checksum: bool = False
     ciphering: bool = False
+    por_security: int = 0
+    por_on_error_only: bool = False
 
     HEADER = b"\x02\x70\x00"
 
@@ -55,6 +57,17 @@ class CommandPacket:
             raise PacketError("counter must fit in five bytes")
         if not 0 <= self.counter_management <= 3:
             raise PacketError("counter management must be between 0 and 3")
+        if not 0 <= self.por_security <= 3:
+            raise PacketError("PoR security must be 0 (none), 1 (RC), 2 (CC), or 3 (DS)")
+        for name, value in (("fake SPI1", self.fake_spi1), ("fake SPI2", self.fake_spi2),
+                            ("fake KIC", self.fake_kic), ("fake KID", self.fake_kid)):
+            if value is not None and not 0 <= value <= 0xFF:
+                raise PacketError(f"{name} must fit in one byte")
+        if self.fake_spi2 is None:
+            if self.por_on_error_only and not self.request_por:
+                raise PacketError("error-only PoR requires request_por=True")
+            if not self.request_por and (self.cipher_por or self.por_mode_submit or self.por_security):
+                raise PacketError("PoR security, ciphering, and mode require a PoR request")
 
     @staticmethod
     def _algorithm_nibble(algorithm: int, *, kic: bool) -> int:
@@ -73,7 +86,8 @@ class CommandPacket:
 
     @property
     def spi2(self) -> int:
-        return ((1 if self.request_por else 0) | (0x10 if self.cipher_por else 0)
+        request = 2 if self.por_on_error_only else (1 if self.request_por else 0)
+        return (request | (self.por_security << 2) | (0x10 if self.cipher_por else 0)
                 | (0x20 if self.por_mode_submit else 0))
 
     @property
@@ -104,6 +118,10 @@ class CommandPacket:
         if data[5] not in (13, 21):
             raise PacketError("command header length must be 13 or 21")
         spi1, spi2, kic, kid = data[6:10]
+        if spi2 & 0xC0 or (spi2 & 3) == 3:
+            raise PacketError("SPI2 contains reserved PoR/RFU coding")
+        if (spi2 & 3) == 0 and spi2 & 0x3C:
+            raise PacketError("SPI2 sets PoR options while PoR is not requested")
         reverse = {0: 0, 1: 1, 5: 2, 9: 3, 13: 4}
         if kic >> 4 != kid >> 4:
             raise PacketError("KIC and KID keysets differ")
@@ -113,9 +131,10 @@ class CommandPacket:
         user_offset = 27 if checksum_present else 19
         return cls(data[10:13], kic >> 4, int.from_bytes(data[13:18], "big"), data[user_offset:],
                    (spi1 >> 3) & 3, reverse[kic & 15], reverse[kid & 15],
-                   (spi2 & 3) == 1, bool(spi2 & 0x10), bool(spi2 & 0x20),
+                   (spi2 & 3) in (1, 2), bool(spi2 & 0x10), bool(spi2 & 0x20),
                    cryptographic_checksum=checksum_present or bool(spi1 & 2),
-                   ciphering=bool(spi1 & 4))
+                   ciphering=bool(spi1 & 4), por_security=(spi2 >> 2) & 3,
+                   por_on_error_only=(spi2 & 3) == 2)
 
 
 # Curated probe corpus retained from SIMTester. "RFM" contains common remote
@@ -406,6 +425,42 @@ def requested_msl(packet: CommandPacket) -> str:
 def is_unsecured_probe(packet: CommandPacket) -> bool:
     """Return whether this command deliberately lacks applied command security."""
     return packet.fake_spi1 is not None or requested_msl(packet).startswith("MSL=0")
+
+
+def describe_por_request(packet: CommandPacket) -> str:
+    """Decode the effective TS 31.115/TS 102 225 SPI2 PoR request."""
+    spi2 = packet.spi2 if packet.fake_spi2 is None else packet.fake_spi2
+    request_code = spi2 & 0x03
+    request = {0: "not requested", 1: "requested-always", 2: "requested-on-error",
+               3: "reserved/invalid"}[request_code]
+    security = {0: "none", 1: "RC", 2: "CC", 3: "DS"}[(spi2 >> 2) & 3]
+    mode = "SMS-SUBMIT" if spi2 & 0x20 else "SMS-DELIVER-REPORT"
+    ciphering = "ciphered" if spi2 & 0x10 else "clear"
+    rfu = spi2 & 0xC0
+    suffix = f", RFU={rfu:02X}" if rfu else ""
+    return (f"SPI2={spi2:02X}: PoR {request}, security={security}, "
+            f"response={mode}/{ciphering}{suffix}")
+
+
+def validate_por_request(packet: CommandPacket, *, envelope_response_required: bool = False) -> tuple[str, ...]:
+    """Validate PoR coding and whether the selected bearer can return it here."""
+    spi2 = packet.spi2 if packet.fake_spi2 is None else packet.fake_spi2
+    request_code = spi2 & 3
+    if request_code == 3:
+        raise PacketError("SPI2 PoR request bits 11 are reserved")
+    if spi2 & 0xC0:
+        raise PacketError("SPI2 RFU bits 7-6 must be zero")
+    requested = request_code in (1, 2)
+    if not requested and spi2 & 0x3C:
+        raise PacketError("PoR security/ciphering/mode is set while PoR is not requested")
+    if envelope_response_required and requested and spi2 & 0x20:
+        raise PacketError("SMS-SUBMIT PoR cannot be returned in the ENVELOPE APDU response")
+    return (
+        describe_por_request(packet),
+        "PoR request coding valid (SPI2 bits 1-0)",
+        "PoR is observable in ENVELOPE response" if requested and not spi2 & 0x20
+        else "PoR is not expected in ENVELOPE response",
+    )
 
 
 def decode_por_status(status: int) -> str:
@@ -1819,6 +1874,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     context_results: list[TARContextResult] = []
     errors = 0
     apdu_validations = 0
+    por_validations = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keysets {keyset_display}; "
           f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
@@ -1853,7 +1909,11 @@ def _run_known_tar_scan(reader: int, keyset: int,
             command = build_sms_pp_download_apdu(packet, third_gen=apdu_format.third_gen)
             validate_sms_pp_download_apdu(command, packet, third_gen=apdu_format.third_gen)
             apdu_validations += 1
+            validate_por_request(packet)
+            por_validations += 1
             print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
+            print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX POR {describe_por_request(packet)}",
+                  flush=True)
             response = None
             for attempt in range(3):
                 try:
@@ -1917,6 +1977,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"3GPP/ETSI APDU structures validated: {apdu_validations}/{len(probe_list)}", flush=True)
+    print(f"3GPP/ETSI PoR SPI2 codings validated: {por_validations}/{len(probe_list)}", flush=True)
     if active_unsecured_msl:
         print("Unsecured MSL matrix attempted: " +
               ", ".join(f"MSL={value:02X}" for value in active_unsecured_msl), flush=True)
@@ -2149,6 +2210,45 @@ def run_self_tests() -> int:
         response = ResponsePacket.parse(raw, strict=False)
         assert response.tar == bytes.fromhex("B00010")
         assert response.counter == 1 and response.additional_data == bytes.fromhex("AABB")
+
+    @check("3GPP and ETSI PoR SPI2 coding")
+    def _por_spi2() -> None:
+        tar = bytes.fromhex("B00010")
+        no_por = CommandPacket(tar, request_por=False)
+        always = CommandPacket(tar)
+        error_only = CommandPacket(tar, por_on_error_only=True)
+        cc_por = CommandPacket(tar, por_security=2)
+        ciphered = CommandPacket(tar, cipher_por=True)
+        submit = CommandPacket(tar, por_mode_submit=True)
+        submit_ciphered = CommandPacket(tar, cipher_por=True, por_mode_submit=True)
+        assert [packet.spi2 for packet in
+                (no_por, always, error_only, cc_por, ciphered, submit, submit_ciphered)] == [
+                    0x00, 0x01, 0x02, 0x09, 0x11, 0x21, 0x31
+                ]
+        assert "requested-on-error" in describe_por_request(error_only)
+        assert "security=CC" in describe_por_request(cc_por)
+        assert "SMS-DELIVER-REPORT" in validate_por_request(always, envelope_response_required=True)[0]
+        try:
+            validate_por_request(submit, envelope_response_required=True)
+        except PacketError as exc:
+            assert "SMS-SUBMIT" in str(exc)
+        else:
+            raise AssertionError("SMS-SUBMIT PoR accepted as an ENVELOPE response")
+        try:
+            validate_por_request(CommandPacket(tar, fake_spi2=0x03))
+        except PacketError as exc:
+            assert "reserved" in str(exc)
+        else:
+            raise AssertionError("reserved PoR request coding accepted")
+        assert CommandPacket.parse(error_only.to_bytes()).por_on_error_only
+        reserved = bytearray(always.to_bytes())
+        reserved[7] = 0x03
+        try:
+            CommandPacket.parse(bytes(reserved))
+        except PacketError as exc:
+            assert "reserved" in str(exc)
+        else:
+            raise AssertionError("parser accepted reserved SPI2 request bits")
 
     @check("ETSI and 3GPP status word decoding")
     def _status_words() -> None:
