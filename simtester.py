@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.4.5"
-BUILD_ID = "channel-scan-dedup-v16"
+__version__ = "0.4.6"
+BUILD_ID = "apdu-scan-findings-v17"
 
 
 class PacketError(ValueError):
@@ -552,8 +552,8 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
         return ResponseAnalysis(False, "none", "CLA unsupported", "Skip the remaining INS values for this CLA")
     if sw in (0x6881, 0x6882):
         if sw == 0x6881:
-            return ResponseAnalysis(False, "low", "CLA understood, but the current logical channel is unsupported",
-                                    "Open and probe UICC logical channels 1 through 19")
+            return ResponseAnalysis(False, "low", "CLA encodes a logical channel the card rejected; INS support is unproven",
+                                    "Record the filtered CLA; probe MANAGE CHANNEL only when explicitly requested")
         return ResponseAnalysis(False, "low", "CLA understood, but secure messaging is unsupported",
                                 "Try the basic channel without secure messaging")
     if response.data:
@@ -1226,6 +1226,7 @@ class ScanFinding:
     value: int
     response: APDUResponse
     channel: int = 0
+    command: bytes = b""
 
 
 def encode_logical_channel_cla(cla: int, channel: int) -> int:
@@ -1273,7 +1274,8 @@ def with_correct_le(command: bytes, le: int) -> bytes:
 def scan_apdus(transport: CardTransport, *, level2: bool = False,
                interesting: Callable[[APDUResponse], bool] | None = None,
                trace: APDUTrace | None = None, retries: int = 2,
-               max_consecutive_errors: int = 10) -> Iterator[ScanFinding]:
+               max_consecutive_errors: int = 10,
+               probe_logical_channels: bool = False) -> Iterator[ScanFinding]:
     """Probe CLA/INS values, tracing every exchange and yielding supported ones."""
     if retries < 0 or max_consecutive_errors < 1:
         raise ValueError("retries must be non-negative and max errors must be positive")
@@ -1358,13 +1360,14 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
             if trace is not None and not response_traced:
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
-                yield ScanFinding(cla << 8 | instruction, response)
+                yield ScanFinding(cla << 8 | instruction, response, command=command)
             # CLA values with channels 0..3 differ only in their low two bits.
             # Probe a class family once; repeating MANAGE CHANNEL for F4, F5,
             # F6 and F7 caused the same channels to be opened and closed four
             # times and produced misleading duplicate APDUs in scan logs.
             canonical_channel_cla = command[0] & 0xFC
-            if response.sw == 0x6881 and canonical_channel_cla not in probed_channel_classes:
+            if (probe_logical_channels and response.sw == 0x6881
+                    and canonical_channel_cla not in probed_channel_classes):
                 probed_channel_classes.add(canonical_channel_cla)
                 opened_channels: list[int] = []
                 try:
@@ -1389,7 +1392,8 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                         if trace is not None:
                             trace(sequence, total, channel_command, channel_response, channel_interesting)
                         if channel_interesting:
-                            yield ScanFinding(cla << 8 | instruction, channel_response, channel)
+                            yield ScanFinding(cla << 8 | instruction, channel_response, channel,
+                                              channel_command)
                 finally:
                     for channel in reversed(opened_channels):
                         close_command = bytes((0x00, 0x70, 0x80, channel))
@@ -1886,12 +1890,15 @@ def _print_response(packet: ResponsePacket) -> None:
                       "proprietary": packet.proprietary}, indent=2))
 
 
-def _run_scan(reader: int, level2: bool) -> None:
+def _run_scan(reader: int, level2: bool, logical_channels: bool = False) -> None:
     mode = "level 2 (CLA and INS)" if level2 else "level 1 (CLA)"
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
+    print("Logical-channel expansion: " +
+          ("enabled (MANAGE CHANNEL probes after 6881)" if logical_channels
+           else "disabled (6881 is recorded without opening channels)"), flush=True)
     status_counts: Counter[int] = Counter()
     primary_status_counts: Counter[int] = Counter()
     followup_status_counts: Counter[int] = Counter()
@@ -1951,7 +1958,8 @@ def _run_scan(reader: int, level2: bool) -> None:
     findings: list[ScanFinding] = []
     aborted = False
     try:
-        for finding in scan_apdus(transport, level2=level2, trace=screen_trace):
+        for finding in scan_apdus(transport, level2=level2, trace=screen_trace,
+                                  probe_logical_channels=logical_channels):
             findings.append(finding)
             response = finding.response
             print(f"FINDING VALUE={finding.value:04X} CHANNEL={finding.channel} SW={response.sw:04X} "
@@ -1971,14 +1979,36 @@ def _run_scan(reader: int, level2: bool) -> None:
         print(f"Follow-up/channel-management responses: {sum(followup_status_counts.values())}", flush=True)
         print(f"Communication errors/retries: {error_count}", flush=True)
         print(f"Potentially supported APDU values: {len(findings)}", flush=True)
-        print("Interesting findings only:", flush=True)
+        print("Primary status-word distribution:", flush=True)
+        if primary_status_counts:
+            for sw, count in primary_status_counts.most_common():
+                info = decode_status_word(sw >> 8, sw & 0xFF)
+                print(f"  SW={sw:04X} COUNT={count} CATEGORY={info.category} - {info.meaning}",
+                      flush=True)
+        else:
+            print("  None", flush=True)
+        rejected_channels = primary_status_counts[0x6881]
+        if rejected_channels:
+            mode_note = ("optional logical-channel expansion was enabled"
+                         if logical_channels else
+                         "logical-channel expansion was disabled; use --logical-channels to test it")
+            print(f"Scan interpretation: {rejected_channels} primary response(s) returned 6881. "
+                  "These CLA bytes encode logical channels rejected by the card; this does not "
+                  f"prove that INS=00 is supported. {mode_note}.", flush=True)
+        if primary_status_counts[0x6E00]:
+            print(f"Scan interpretation: {primary_status_counts[0x6E00]} primary response(s) "
+                  "returned 6E00, so those command classes were rejected.", flush=True)
+        if primary_status_counts[0x6D00]:
+            print(f"Scan interpretation: {primary_status_counts[0x6D00]} primary response(s) "
+                  "returned 6D00, so those instructions were rejected in the tested context.",
+                  flush=True)
+        print("Actionable findings:", flush=True)
         if findings:
             for finding in findings:
                 response = finding.response
                 info = decode_status_word(response.sw1, response.sw2)
-                base_cla = finding.value >> 8
-                actual_cla = encode_logical_channel_cla(base_cla, finding.channel)
-                command = bytes((actual_cla, finding.value & 0xFF, 0, 0))
+                command = finding.command or bytes((finding.value >> 8,
+                                                    finding.value & 0xFF, 0, 0))
                 analysis = analyze_apdu_response(command, response)
                 print(f"  CLA={finding.value >> 8:02X} INS={finding.value & 0xFF:02X} "
                       f"CHANNEL={finding.channel} APDU={command.hex().upper()} SW={response.sw:04X} "
@@ -2736,8 +2766,17 @@ def run_self_tests() -> int:
         assert list(scan_apdus(MockTransport(unsupported_cla), level2=True)) == []
         assert calls == 256
 
-    @check("6881 opens and probes 3GPP logical channels")
+    @check("6881 is passive by default and optionally probes logical channels")
     def _logical_channels() -> None:
+        default_commands: list[bytes] = []
+        def default_6881(apdu: bytes) -> APDUResponse:
+            default_commands.append(apdu)
+            return APDUResponse(b"", 0x68, 0x81)
+
+        assert list(scan_apdus(MockTransport(default_6881))) == []
+        assert len(default_commands) == 256
+        assert bytes.fromhex("0070000001") not in default_commands
+
         commands: list[bytes] = []
 
         def channel_card(apdu: bytes) -> APDUResponse:
@@ -2752,9 +2791,10 @@ def run_self_tests() -> int:
                 return APDUResponse(b"", 0x90, 0)
             return APDUResponse(b"", 0x6E, 0)
 
-        scanner = scan_apdus(MockTransport(channel_card))
+        scanner = scan_apdus(MockTransport(channel_card), probe_logical_channels=True)
         finding = next(scanner)
         assert finding.channel == 1 and finding.response.data == b"channel-one"
+        assert finding.command == bytes.fromhex("01000000")
         scanner.close()
         assert commands[:3] == [bytes.fromhex("00000000"), bytes.fromhex("0070000001"),
                                bytes.fromhex("01000000")]
@@ -2779,7 +2819,8 @@ def run_self_tests() -> int:
                 return APDUResponse(b"", 0x68, 0x81)
             return APDUResponse(b"", 0x6E, 0)
 
-        assert list(scan_apdus(MockTransport(repeated_6881))) == []
+        assert list(scan_apdus(MockTransport(repeated_6881),
+                               probe_logical_channels=True)) == []
         # F4..F7 are one CLA family with channel bits 0..3: manage it once,
         # rather than reopening the same card-wide channels for every raw CLA.
         assert family_commands.count(bytes.fromhex("0070000001")) == 2
@@ -2962,7 +3003,10 @@ def interactive_menu() -> int:
                                         title="POPULAR TAR SCAN" if quick else "KNOWN TAR SCAN")
             elif choice == "3":
                 level = _read_int("APDU scan level [1]: ", 1)
-                _run_scan(_select_reader(), level == 2)
+                logical_channels = input(
+                    "Expand 6881 results with temporary logical channels? [y/N]: "
+                ).strip().lower() == "y"
+                _run_scan(_select_reader(), level == 2, logical_channels)
             elif choice == "4":
                 tar = input("TAR [B00010]: ").strip().upper() or "B00010"
                 keyset = _read_int("Keyset [0]: ")
@@ -2990,6 +3034,8 @@ def make_parser() -> argparse.ArgumentParser:
     parse.add_argument("hex"); parse.add_argument("--lenient", action="store_true")
     scan = commands.add_parser("scan-apdu")
     scan.add_argument("--reader", type=int, default=0); scan.add_argument("--level2", action="store_true")
+    scan.add_argument("--logical-channels", action="store_true",
+                      help="open temporary logical channels to expand 6881 results (off by default)")
     known = commands.add_parser("known-tars")
     known.add_argument("--keyset", type=int, help="single keyset (legacy alias)")
     known.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
@@ -3027,7 +3073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "parse-response":
         _print_response(ResponsePacket.parse(bytes.fromhex(args.hex), strict=not args.lenient))
     elif args.command == "scan-apdu":
-        _run_scan(args.reader, args.level2)
+        _run_scan(args.reader, args.level2, args.logical_channels)
     elif args.command == "known-tars":
         selected = None if args.groups.upper() == "ALL" else tuple(
             group.strip().upper() for group in args.groups.split(",")
