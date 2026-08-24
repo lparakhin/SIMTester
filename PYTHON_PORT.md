@@ -69,6 +69,8 @@ Running `python simtester.py` now shows only the four primary test workflows:
 4. OTA fuzzing of PID, DCS, and UDHI values (common values or brute force).
 
 Lower-level packet and automation commands remain available as CLI subcommands.
+Reader discovery and card connection failures are reported as short actionable
+errors (for example, asking the user to insert the card) rather than tracebacks.
 
 There is nothing to install and no second Python source file. Examples:
 

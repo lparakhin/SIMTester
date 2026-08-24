@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import time
 from collections import Counter
@@ -344,23 +345,35 @@ class PCSCTransport:
     """Optional pyscard-backed PC/SC transport."""
 
     @staticmethod
-    def readers() -> list[str]:
+    def _reader_objects() -> list[object]:
+        if importlib.util.find_spec("smartcard") is None:
+            raise RuntimeError("PC/SC requires the optional 'pyscard' package")
+        from smartcard.System import readers
         try:
-            from smartcard.System import readers
-        except ImportError as exc:
-            raise RuntimeError("PC/SC requires the optional 'pyscard' package") from exc
-        return [str(reader) for reader in readers()]
+            return list(readers())
+        except Exception as exc:
+            raise RuntimeError(f"Unable to list PC/SC readers: {exc}") from exc
+
+    @classmethod
+    def readers(cls) -> list[str]:
+        return [str(reader) for reader in cls._reader_objects()]
+
+    @staticmethod
+    def _connect(connection: object) -> None:
+        try:
+            connection.connect()
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to connect to the smart card. Ensure the card is inserted "
+                f"and stable in the reader. PC/SC reported: {exc}"
+            ) from exc
 
     def __init__(self, reader_index: int = 0):
-        try:
-            from smartcard.System import readers
-        except ImportError as exc:
-            raise RuntimeError("PC/SC requires the optional 'pyscard' package") from exc
-        available = readers()
+        available = self._reader_objects()
         if not 0 <= reader_index < len(available):
             raise RuntimeError(f"reader {reader_index} unavailable; found {len(available)}")
         self.connection = available[reader_index].createConnection()
-        self.connection.connect()
+        self._connect(self.connection)
 
     def transmit(self, apdu: bytes) -> APDUResponse:
         data, sw1, sw2 = self.connection.transmit(list(apdu))
@@ -372,7 +385,7 @@ class PCSCTransport:
             self.connection.disconnect()
         except Exception:
             pass
-        self.connection.connect()
+        self._connect(self.connection)
 
     def close(self) -> None:
         self.connection.disconnect()
@@ -799,6 +812,20 @@ def run_self_tests() -> int:
         assert list(scanner) == []
         assert calls == 257
 
+    @check("missing card connection has a friendly error")
+    def _missing_card() -> None:
+        class RemovedCardConnection:
+            def connect(self) -> None:
+                raise OSError("smart card removed (0x80100069)")
+
+        try:
+            PCSCTransport._connect(RemovedCardConnection())
+        except RuntimeError as exc:
+            assert "Ensure the card is inserted" in str(exc)
+            assert "0x80100069" in str(exc)
+        else:
+            raise AssertionError("missing card connection should fail")
+
     failures = 0
     for name, function in checks:
         try:
@@ -915,4 +942,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except (PacketError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}")
+        exit_code = 1
+    raise SystemExit(exit_code)
