@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: ascii -*-
 """Standalone Python SIMTester: codecs, transports, scanners, CLI, and menu."""
 from __future__ import annotations
 
@@ -340,7 +341,7 @@ def interactive_menu() -> int:
         "0": "Exit",
     }
     while True:
-        print("\nSIMTester Python — authorized test cards only")
+        print("\nSIMTester Python - authorized test cards only")
         for key, label in actions.items():
             print(f"  {key}. {label}")
         choice = input("Choose an option: ").strip()

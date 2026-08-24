@@ -53,6 +53,8 @@ python simtester.py self-test
 
 Run `python simtester.py` without arguments to open the menu. All Python code,
 including its dependency-free self-tests, is contained in that one script.
+The script intentionally contains ASCII source text only, so it also runs when
+copied through Windows editors that do not preserve UTF-8 encoding.
 
 ## Scope and safety
 
