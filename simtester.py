@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.5"
-BUILD_ID = "popular-tar-keysets-v6"
+__version__ = "0.3.6"
+BUILD_ID = "apdu-response-analysis-v7"
 
 
 class PacketError(ValueError):
@@ -181,6 +181,61 @@ def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True,
     if len(envelope) > 255:
         raise PacketError("SMS-PP envelope exceeds short APDU length")
     return bytes((0x80 if third_gen else 0xA0, 0xC2, 0x00, 0x00, len(envelope))) + envelope
+
+
+def validate_sms_pp_download_apdu(apdu: bytes, packet: CommandPacket, *,
+                                  third_gen: bool = True, pid: int = 0x7F,
+                                  dcs: int = 0xF6, udhi: bool = True) -> tuple[str, ...]:
+    """Validate the generated 3GPP/ETSI SMS-PP DOWNLOAD command hierarchy.
+
+    This checks the short ENVELOPE APDU, BER-TLV lengths, terminal-to-UICC
+    device identities, SMS-TPDU layout, and embedded secured command packet.
+    It intentionally validates structure rather than claiming card acceptance.
+    """
+    expected_cla = 0x80 if third_gen else 0xA0
+    expected_tags = (0x82, 0x86, 0x8B) if third_gen else (0x02, 0x06, 0x0B)
+    if len(apdu) < 7 or apdu[:4] != bytes((expected_cla, 0xC2, 0, 0)):
+        raise PacketError("ENVELOPE must use the detected CLA, INS C2 and P1/P2=0000")
+    if apdu[4] != len(apdu) - 5:
+        raise PacketError("ENVELOPE short-APDU Lc does not match its data length")
+    if apdu[5] != 0xD1 or apdu[6] != len(apdu) - 7:
+        raise PacketError("SMS-PP DOWNLOAD template D1 length is inconsistent")
+    body = apdu[7:]
+    if body[:4] != bytes((expected_tags[0], 0x02, 0x83, 0x81)):
+        raise PacketError("device identities must encode network-to-UICC (83 to 81)")
+    offset = 4
+    if len(body) < offset + 2 or body[offset] != expected_tags[1]:
+        raise PacketError("SMS-PP address TLV is missing or uses the wrong comprehension tag")
+    address_length = body[offset + 1]
+    offset += 2 + address_length
+    if address_length < 2 or len(body) < offset + 2 or body[offset] != expected_tags[2]:
+        raise PacketError("SMS TPDU TLV is missing or the address value is malformed")
+    tpdu_length = body[offset + 1]
+    tpdu = body[offset + 2:]
+    if tpdu_length != len(tpdu) or len(tpdu) < 13:
+        raise PacketError("SMS-DELIVER TPDU length is inconsistent")
+    first_octet = tpdu[0]
+    if first_octet & 0x03:
+        raise PacketError("TP-MTI must encode SMS-DELIVER")
+    if bool(first_octet & 0x40) != udhi:
+        raise PacketError("TP-UDHI does not match the requested OTA transport mode")
+    oa_octets = (tpdu[1] + 1) // 2
+    pid_offset = 3 + oa_octets
+    if len(tpdu) < pid_offset + 10 or tpdu[pid_offset:pid_offset + 2] != bytes((pid, dcs)):
+        raise PacketError("TP-OA, TP-PID or TP-DCS is inconsistent")
+    udl_offset = pid_offset + 9
+    user_data = tpdu[udl_offset + 1:]
+    if tpdu[udl_offset] != len(user_data):
+        raise PacketError("TP-UDL does not match the octet-aligned TP-UD length")
+    if user_data != packet.to_bytes():
+        raise PacketError("TP-UD does not contain the expected secured command packet")
+    CommandPacket.parse(user_data)
+    return (
+        f"short APDU case 3: CLA={expected_cla:02X}, INS=C2, Lc={apdu[4]}",
+        f"SMS-PP DOWNLOAD D1: device identities network-to-UICC, TPDU={tpdu_length} byte(s)",
+        f"SMS-DELIVER: UDHI={'set' if udhi else 'clear'}, PID={pid:02X}, DCS={dcs:02X}, UDL={len(user_data)}",
+        "secured packet: UDH/CPH=027000, CPL/CHL and payload lengths valid",
+    )
 
 
 FUZZER_PROFILES = (
@@ -1462,6 +1517,55 @@ def classify_tar_scan_results(
     return baseline, count, findings
 
 
+def analyze_fuzzer_response_patterns(
+    results: Sequence[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]],
+) -> tuple[str, ...]:
+    """Correlate transport responses with profile, keyset, and PoR mode."""
+    if not results:
+        return ("No responses available for correlation.",)
+    lines: list[str] = []
+    parsed_count = sum(result[4] is not None for result in results)
+    empty_success = [result for result in results
+                     if result[3].sw == 0x9000 and not result[3].data and result[4] is None]
+    submit_success = [result for result in empty_success if result[2].por_mode_submit]
+    if submit_success:
+        lines.append(
+            f"{len(submit_success)} submit-mode probe(s) returned empty 9000. This confirms "
+            "ENVELOPE/TPDU transport acceptance only: an SMS-SUBMIT PoR is not returned "
+            "inside this APDU response, so OTA command execution and TAR support remain unproven."
+        )
+    warning_rows = [result for result in results if result[3].sw1 == 0x62 and not result[3].data]
+    if warning_rows:
+        lines.append(
+            f"{len(warning_rows)} probe(s) returned an empty 62xx warning. Repetition across "
+            "different TAR/keyset/security profiles indicates a shared UICC ENVELOPE/parser "
+            "path rather than independent evidence that those TARs exist."
+        )
+    # A profile with one invariant signature over several keysets is unlikely to
+    # be demonstrating successful key selection, especially without a PoR.
+    by_profile: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for label, tar, _packet, response, _parsed in results:
+        profile = label.split("/K", 1)[0]
+        by_profile.setdefault((tar, profile), []).append(
+            (label, f"{response.sw:04X}:{response.data.hex().upper()}")
+        )
+    invariant = []
+    for (tar, profile), observations in by_profile.items():
+        keysets = {label.rsplit("/K", 1)[-1] for label, _ in observations if "/K" in label}
+        signatures = {signature for _, signature in observations}
+        if len(keysets) > 1 and len(signatures) == 1:
+            invariant.append(f"{profile}:{tar} ({len(keysets)} keysets -> {next(iter(signatures)).split(':')[0]})")
+    if invariant:
+        preview = ", ".join(invariant[:8]) + (f", +{len(invariant) - 8} more" if len(invariant) > 8 else "")
+        lines.append("Keyset-invariant profiles: " + preview +
+                     ". Treat these as pre-security transport behavior unless a parseable PoR differs by keyset.")
+    if parsed_count == 0:
+        lines.append("No parseable 03.48/31.115 response packet was received; no MSL=0 vulnerability is proven.")
+    else:
+        lines.append(f"{parsed_count} parseable PoR packet(s) permit application-level TAR/MSL conclusions.")
+    return tuple(lines)
+
+
 def _hex(prompt: str, *, length: int | None = None, default: str = "") -> bytes:
     value = input(prompt).strip() or default
     try:
@@ -1587,7 +1691,7 @@ def _run_scan(reader: int, level2: bool) -> None:
 def _run_known_tar_scan(reader: int, keyset: int,
                         groups: Iterable[str] | None = None,
                         probes: Iterable[tuple[str, CommandPacket]] | None = None,
-                        title: str = "KNOWN TAR SCAN") -> None:
+                        title: str = "KNOWN TAR SCAN", *, force_por: bool = True) -> None:
     """Deliver the known TAR corpus over SMS-PP and summarize card responses."""
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
@@ -1595,10 +1699,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
     supplied_probes = known_tar_packets(keyset, groups) if probes is None else probes
     # A TAR scan is only conclusive when the UICC can return a response packet.
     # Force the PoR request bit even for caller-supplied packets that omitted it.
-    probe_list = [
-        (group, ensure_por_requested(packet))
-        for group, packet in supplied_probes
-    ]
+    probe_list = [(group, ensure_por_requested(packet) if force_por else packet)
+                  for group, packet in supplied_probes]
     active_keysets = sorted({packet.keyset for _, packet in probe_list})
     keyset_display = ",".join(map(str, active_keysets)) or str(keyset)
     transport = PCSCTransport(reader)
@@ -1606,6 +1708,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
     context_results: list[TARContextResult] = []
     errors = 0
+    apdu_validations = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keysets {keyset_display}; "
           f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
@@ -1635,6 +1738,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
         for index, (group, packet) in enumerate(probe_list, 1):
             tar = packet.tar.hex().upper()
             command = build_sms_pp_download_apdu(packet, third_gen=apdu_format.third_gen)
+            validate_sms_pp_download_apdu(command, packet, third_gen=apdu_format.third_gen)
+            apdu_validations += 1
             print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
             response = None
             for attempt in range(3):
@@ -1698,6 +1803,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
+    print(f"3GPP/ETSI APDU structures validated: {apdu_validations}/{len(probe_list)}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
     print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
     if baseline_count:
@@ -1741,6 +1847,9 @@ def _run_known_tar_scan(reader: int, keyset: int,
               f"{warning} - {info.meaning}", flush=True)
     if not interesting_results:
         print("  None", flush=True)
+    print("Advanced response correlation:", flush=True)
+    for line in analyze_fuzzer_response_patterns(results):
+        print(f"  - {line}", flush=True)
     print("============================================", flush=True)
 
 
@@ -1996,6 +2105,17 @@ def run_self_tests() -> int:
         envelope = build_sms_pp_download_apdu(packet)
         assert envelope[:5] == bytes((0x80, 0xC2, 0, 0, len(envelope) - 5))
         assert packet.to_bytes() in envelope
+        validation = validate_sms_pp_download_apdu(envelope, packet)
+        assert "CLA=80, INS=C2" in validation[0]
+        assert "network-to-UICC" in validation[1]
+        assert "PID=7F, DCS=F6" in validation[2]
+        broken = envelope[:4] + bytes((envelope[4] - 1,)) + envelope[5:]
+        try:
+            validate_sms_pp_download_apdu(broken, packet)
+        except PacketError:
+            pass
+        else:
+            raise AssertionError("invalid ENVELOPE Lc accepted")
 
     @check("standard fuzzer matrix and OTA envelope variants")
     def _fuzzing_modes() -> None:
@@ -2005,6 +2125,8 @@ def run_self_tests() -> int:
         assert packets[-2][0] == "U-SUBMIT/K1"
         assert packets[-1][0] == "U-SUBMIT-CIPHER-POR/K1"
         assert all(requested_msl(packet).startswith("MSL=0") for _, packet in packets[-2:])
+        assert not packets[0][1].request_por and packets[1][1].request_por
+        assert packets[0][1].to_bytes() != packets[1][1].to_bytes()
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain
@@ -2029,6 +2151,19 @@ def run_self_tests() -> int:
         assert any("PID conclusion" in line for line in intelligence)
         assert any("no PoR/data proves OTA execution" in line for line in intelligence)
         assert any("not an unprotected-TAR finding" in line for line in intelligence)
+
+        pattern_rows = []
+        for keyset in (1, 2, 3):
+            for label, submit, sw in (("F00", False, 0x6200), ("U-SUBMIT", True, 0x9000)):
+                profile_packet = CommandPacket(bytes.fromhex("B00010"), keyset=keyset,
+                                               por_mode_submit=submit)
+                pattern_rows.append((f"{label}/K{keyset}", "B00010", profile_packet,
+                                     APDUResponse(b"", sw >> 8, sw & 0xFF), None))
+        patterns = analyze_fuzzer_response_patterns(pattern_rows)
+        assert any("transport acceptance only" in line for line in patterns)
+        assert any("shared UICC ENVELOPE/parser path" in line for line in patterns)
+        assert any("Keyset-invariant profiles" in line for line in patterns)
+        assert any("no MSL=0 vulnerability is proven" in line for line in patterns)
 
     @check("combined ATR index, forced PoR and TAR context probes")
     def _tar_scan_intelligence() -> None:
@@ -2327,7 +2462,7 @@ def interactive_menu() -> int:
                 keyset_list = [int(value) for value in (keysets or ",".join(map(str, POPULAR_KEYSETS))).split(",")]
                 reader = _select_reader()
                 _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
-                                    title="STANDARD FUZZING")
+                                    title="STANDARD FUZZING", force_por=False)
             elif choice == "2":
                 mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
                 entered_keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()

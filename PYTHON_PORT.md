@@ -73,6 +73,12 @@ to the original matrix. Quick known-TAR scans use the common RAM/WIB/S@T/RFM
 values `000000`, `000001`, `505348`, `534054`, `B00001`, and `B00010` across
 keysets 1 through 6 by default; full-corpus and custom keyset scans remain
 available.
+Standard fuzzing preserves each profile's SPI2 exactly; unlike conclusive TAR
+scans, it does not force PoR onto the original no-PoR control. Before sending,
+the tool validates ENVELOPE CLA/INS/P1/P2/Lc, the `D1` TLV hierarchy,
+network-to-UICC identities, SMS-DELIVER PID/DCS/UDL, and secured-packet lengths.
+Response correlation distinguishes repeated parser warnings and empty
+submit-mode acknowledgements from parseable PoR evidence.
 
 Lower-level packet and automation commands remain available as CLI subcommands.
 Reader discovery and card connection failures are reported as short actionable
@@ -141,7 +147,7 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the current build reports `popular-tar-keysets-v6`.
+being executed, and the current build reports `apdu-response-analysis-v7`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as
