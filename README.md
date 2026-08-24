@@ -8,7 +8,7 @@
 > APDU scans display every command and response on screen as they run.
 > At the end, they print decoded ETSI/3GPP status words and a complete findings summary.
 > `61xx` is followed with GET RESPONSE, and known S@T/WIB/vendor TAR probe packets
-> are available from menu option 9 or the `known-tars` command.
+> can be scanned from menu option 9 or `scan-known-tars` (`known-tars` previews them).
 
 SIMTester assess SIM card security in two dimensions:
 

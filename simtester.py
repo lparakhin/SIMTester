@@ -123,6 +123,31 @@ def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> I
             yield group, CommandPacket(bytes.fromhex(value), keyset=keyset, user_data=b"\0" * 5)
 
 
+def _tlv(tag: int, value: bytes) -> bytes:
+    if len(value) <= 0x7F:
+        length = bytes((len(value),))
+    elif len(value) <= 0xFF:
+        length = bytes((0x81, len(value)))
+    else:
+        length = b"\x82" + len(value).to_bytes(2, "big")
+    return bytes((tag,)) + length + value
+
+
+def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True) -> bytes:
+    """Wrap an OTA packet in an SMS-PP DOWNLOAD ENVELOPE APDU."""
+    command_packet = packet.to_bytes()
+    # SMS-DELIVER: UDHI, fixed test originator, SIM data-download PID/DCS.
+    tpdu = (b"\x44\x05\x00\x21\x43\xF5\x7F\xF6" + b"\0" * 7
+            + bytes((len(command_packet),)) + command_packet)
+    device_identities = bytes((0x82 if third_gen else 0x02, 0x02, 0x83, 0x81))
+    address = bytes.fromhex("86050021436587" if third_gen else "06050021436587")
+    sms_tpdu = bytes((0x8B if third_gen else 0x0B, len(tpdu))) + tpdu
+    envelope = _tlv(0xD1, device_identities + address + sms_tpdu)
+    if len(envelope) > 255:
+        raise PacketError("SMS-PP envelope exceeds short APDU length")
+    return bytes((0x80 if third_gen else 0xA0, 0xC2, 0x00, 0x00, len(envelope))) + envelope
+
+
 @dataclass(frozen=True)
 class ResponsePacket:
     tar: bytes | None
@@ -521,6 +546,83 @@ def _run_scan(reader: int, level2: bool) -> None:
         print("=======================================", flush=True)
 
 
+def _run_known_tar_scan(reader: int, keyset: int,
+                        groups: Iterable[str] | None = None) -> None:
+    """Deliver the known TAR corpus over SMS-PP and summarize card responses."""
+    reader_names = PCSCTransport.readers()
+    if not 0 <= reader < len(reader_names):
+        raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
+    probes = list(known_tar_packets(keyset, groups))
+    transport = PCSCTransport(reader)
+    results: list[tuple[str, str, APDUResponse, ResponsePacket | None]] = []
+    errors = 0
+    print(f"KNOWN TAR SCAN START: {len(probes)} probes; reader {reader}: "
+          f"{reader_names[reader]}; keyset {keyset}", flush=True)
+    try:
+        for index, (group, packet) in enumerate(probes, 1):
+            tar = packet.tar.hex().upper()
+            command = build_sms_pp_download_apdu(packet)
+            print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
+            response = None
+            for attempt in range(3):
+                try:
+                    response = transport.transmit(command)
+                    break
+                except Exception as exc:
+                    errors += 1
+                    print(f"[{index:03d}/{len(probes):03d}] ERROR {exc} - "
+                          f"{'retrying' if attempt < 2 else 'SKIPPED'}", flush=True)
+                    if attempt < 2:
+                        try:
+                            transport.reconnect()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+            if response is None:
+                continue
+            data = response.data
+            while response.sw1 == 0x61:
+                followup_apdu = bytes((command[0], 0xC0, 0, 0, response.sw2))
+                print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} "
+                      f"TX GET RESPONSE={followup_apdu.hex().upper()}", flush=True)
+                try:
+                    response = transport.transmit(followup_apdu)
+                except Exception as exc:
+                    errors += 1
+                    print(f"[{index:03d}/{len(probes):03d}] GET RESPONSE ERROR: {exc}", flush=True)
+                    break
+                data += response.data
+            response = APDUResponse(data, response.sw1, response.sw2)
+            info = decode_status_word(response.sw1, response.sw2)
+            parsed = None
+            try:
+                parsed = ResponsePacket.parse(response.data, strict=False)
+            except PacketError:
+                pass
+            ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
+            print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} RX "
+                  f"DATA={data.hex().upper() or '<empty>'} SW={response.sw:04X}{ota} "
+                  f"- {info.meaning}", flush=True)
+            results.append((group, tar, response, parsed))
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+    parsed_results = [result for result in results if result[3] is not None]
+    print("\n========== KNOWN TAR SCAN SUMMARY ==========", flush=True)
+    print(f"Probes attempted: {len(probes)}", flush=True)
+    print(f"Card responses: {len(results)}", flush=True)
+    print(f"Communication errors/retries: {errors}", flush=True)
+    print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
+    for group, tar, response, parsed in results:
+        info = decode_status_word(response.sw1, response.sw2)
+        ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
+        print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
+              f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
+    print("============================================", flush=True)
+
+
 def run_self_tests() -> int:
     """Run dependency-free checks bundled into this standalone script."""
     checks: list[tuple[str, Callable[[], None]]] = []
@@ -581,7 +683,11 @@ def run_self_tests() -> int:
         assert len(KNOWN_TAR_GROUPS["SAT"]) == 2
         assert len(KNOWN_TAR_GROUPS["WIB"]) == 20
         assert sum(map(len, KNOWN_TAR_GROUPS.values())) == 135
-        assert next(known_tar_packets(groups=("SAT",)))[1].tar == bytes.fromhex("505348")
+        packet = next(known_tar_packets(groups=("SAT",)))[1]
+        assert packet.tar == bytes.fromhex("505348")
+        envelope = build_sms_pp_download_apdu(packet)
+        assert envelope[:5] == bytes((0x80, 0xC2, 0, 0, len(envelope) - 5))
+        assert packet.to_bytes() in envelope
 
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
@@ -633,7 +739,7 @@ def interactive_menu() -> int:
         "3": "Parse OTA response packet", "4": "Preview TAR scan packets",
         "5": "List PC/SC readers", "6": "Run APDU level 1 scan",
         "7": "Run APDU level 2 scan", "8": "Run built-in self-tests",
-        "9": "Preview known S@T/WIB/vendor TAR probes",
+        "9": "Scan known S@T/WIB/vendor TARs over SMS-PP",
         "0": "Exit",
     }
     while True:
@@ -671,8 +777,8 @@ def interactive_menu() -> int:
                 groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
                 selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
                 keyset = _read_int("Keyset [0]: ")
-                for group, packet in known_tar_packets(keyset, selected):
-                    print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
+                reader = _read_int("Reader index [0]: ")
+                _run_known_tar_scan(reader, keyset, selected)
             else:
                 print("Unknown option. Choose 0 through 9.")
         except (PacketError, RuntimeError, ValueError) as exc:
@@ -695,6 +801,10 @@ def make_parser() -> argparse.ArgumentParser:
     known = commands.add_parser("known-tars")
     known.add_argument("--keyset", type=int, default=0)
     known.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
+    known_scan = commands.add_parser("scan-known-tars")
+    known_scan.add_argument("--reader", type=int, default=0)
+    known_scan.add_argument("--keyset", type=int, default=0)
+    known_scan.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
     commands.add_parser("menu")
     commands.add_parser("self-test")
     return parser
@@ -719,6 +829,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for group, packet in known_tar_packets(args.keyset, selected):
             print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
+    elif args.command == "scan-known-tars":
+        selected = None if args.groups.upper() == "ALL" else tuple(
+            group.strip().upper() for group in args.groups.split(",")
+        )
+        _run_known_tar_scan(args.reader, args.keyset, selected)
     return 0
 
 
