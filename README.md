@@ -26,12 +26,14 @@
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; current scans identify build `get-data-cla-fallback-v12`.
+> Use `python simtester.py --version`; current scans identify build `get-data-evidence-v13`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
 > Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
 > field-level decode with the raw response retained for auditing. UICC GET DATA
 > tries ISO interindustry `00 CA 00 66 00` and the detected telecom CLA
 > (`80` for UICC or `A0` for classic SIM), then decodes card-recognition template `66`.
+> When object `0066` is unavailable, output lists each full APDU, SW, and decoded
+> reason without repeating empty raw data or presenting the optional probe as an error.
 > Quick scans default to popular TARs `000000`, `000001`, `505348`, `534054`,
 > `B00001`, and `B00010` across commonly used keysets 1-6. Standard fuzzing
 > also checks submit-mode clear and ciphered PoR requests with MSL=0 commands.

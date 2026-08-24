@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.4.1"
-BUILD_ID = "get-data-cla-fallback-v12"
+__version__ = "0.4.2"
+BUILD_ID = "get-data-evidence-v13"
 
 
 class PacketError(ValueError):
@@ -1557,8 +1557,8 @@ def decode_tar_context_response(name: str, response: APDUResponse) -> tuple[str,
     if name.startswith("GET DATA") and response.sw == 0x9000:
         return decode_card_recognition_data(response.data)
     if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
-        return (f"GET DATA command format is not supported (SW={response.sw:04X})",
-                "This result is unrelated to TAR existence, MSL, or PoR support")
+        return ("Card Recognition Data object 0066 was not returned",
+                "This optional capability result is unrelated to TAR existence, MSL, or PoR support")
     return ()
 
 
@@ -1576,10 +1576,15 @@ def summarize_tar_context_response(name: str, response: APDUResponse,
         suffix = f"; capability field(s)={capabilities}" if capabilities else ""
         return "GET DATA OK: " + "; ".join(templates or (f"{len(response.data)} byte(s) returned",)) + suffix
     if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
-        formats = next((detail for detail in decoded if detail.startswith("Formats tried:")), "")
-        suffix = f"; {formats}" if formats else ""
-        return (f"GET DATA card-recognition object unavailable ({response.sw:04X}){suffix}; "
-                "unrelated to TAR/MSL/PoR")
+        attempts = [detail for detail in decoded if detail.startswith("Attempt ")]
+        statuses = ", ".join(
+            f"{'ISO' if detail.startswith('Attempt ISO') else 'telecom'}="
+            f"{match.group(1) if (match := re.search(r'SW=([0-9A-F]{4})', detail)) else 'unknown'}"
+            for detail in attempts
+        )
+        suffix = f"; attempts={statuses}" if statuses else f"; SW={response.sw:04X}"
+        return ("GET DATA object 0066 is not exposed by the tested command classes"
+                f"{suffix}; no TAR/MSL/PoR conclusion")
     info = decode_status_word(response.sw1, response.sw2)
     return f"{name}: SW={response.sw:04X} ({info.meaning})"
 
@@ -1597,8 +1602,8 @@ def analyze_tar_context_response(name: str, command: bytes,
                                     f"Card continues to request Le={response.sw2 or 256}; do not infer TAR support")
     if name.startswith("GET DATA") and response.sw in (0x6D00, 0x6E00, 0x6A81, 0x6A88):
         return ResponseAnalysis(False, "none",
-                                "Optional ISO GET DATA object is unavailable in this UICC command context",
-                                "Treat as a context capability result, not evidence for or against OTA/TAR support")
+                                "Optional Card Recognition Data object 0066 is not exposed under the tested CLAs",
+                                "Use ATR/STATUS for card context; do not infer anything about OTA/TAR support")
     generic = analyze_apdu_response(command, response)
     return ResponseAnalysis(generic.interesting, generic.severity, generic.conclusion,
                             generic.next_step + "; do not infer a TAR from this context command")
@@ -1634,11 +1639,13 @@ def probe_tar_scan_context(transport: CardTransport,
             break
     rank = {0x9000: 5, 0x6A88: 4, 0x6A81: 3, 0x6D00: 1, 0x6E00: 0}
     command, response = max(candidate_results, key=lambda item: rank.get(item[1].sw, 2))
-    formats = "Formats tried: " + ", ".join(
-        f"CLA={candidate[0]:02X}->SW={candidate_response.sw:04X}"
+    attempt_details = tuple(
+        f"Attempt {'ISO interindustry' if candidate[0] == 0 else 'UICC/SIM telecom'} "
+        f"APDU={candidate.hex().upper()} -> SW={candidate_response.sw:04X} "
+        f"({decode_status_word(candidate_response.sw1, candidate_response.sw2).meaning})"
         for candidate, candidate_response in candidate_results
     )
-    decoded = decode_tar_context_response(get_data_name, response) + (formats,)
+    decoded = decode_tar_context_response(get_data_name, response) + attempt_details
     results.append(TARContextResult(
         get_data_name, command, response,
         analyze_tar_context_response(get_data_name, command, response),
@@ -1940,8 +1947,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
                 print(f"    COMPACT={context.short_decoded}", flush=True)
                 if context.decoded:
                     print("    EXPANDED:", flush=True)
-                    print(f"      - Raw response data="
-                          f"{context.response.data.hex().upper() or '<empty>'}", flush=True)
+                    if context.response.data:
+                        print(f"      - Raw response data={context.response.data.hex().upper()}", flush=True)
                     for detail in context.decoded:
                         print(f"      - {detail}", flush=True)
         except Exception as exc:
@@ -2038,14 +2045,17 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print("GET STATUS / GET DATA context:", flush=True)
     for context in context_results:
         info = decode_status_word(context.response.sw1, context.response.sw2)
+        meaning = ("Optional Card Recognition Data object 0066 unavailable"
+                   if context.name.startswith("GET DATA") and not context.analysis.interesting
+                   else info.meaning)
         print(f"  {context.name}: SW={context.response.sw:04X} "
-              f"SEVERITY={context.analysis.severity} - {info.meaning}; "
+              f"SEVERITY={context.analysis.severity} - {meaning}; "
               f"{context.analysis.conclusion}", flush=True)
         print(f"    COMPACT: {context.short_decoded}", flush=True)
         if context.decoded:
             print("    EXPANDED:", flush=True)
-            print(f"      - Raw response data="
-                  f"{context.response.data.hex().upper() or '<empty>'}", flush=True)
+            if context.response.data:
+                print(f"      - Raw response data={context.response.data.hex().upper()}", flush=True)
             for detail in context.decoded:
                 print(f"      - {detail}", flush=True)
     if not context_results:
@@ -2508,11 +2518,22 @@ def run_self_tests() -> int:
         assert "UICC STATUS succeeded" in context[0].analysis.conclusion
         assert context[1].response.sw == 0x6A88
         assert not context[1].analysis.interesting
-        assert "Optional ISO GET DATA" in context[1].analysis.conclusion
+        assert "object 0066 is not exposed" in context[1].analysis.conclusion
         assert commands == [bytes.fromhex(value) for value in (
             "80F2000000", "80F200002B", "00CA006600", "80CA006600"
         )]
-        assert "Formats tried: CLA=00->SW=6A88, CLA=80->SW=6A88" in context[1].decoded
+        assert any("APDU=00CA006600 -> SW=6A88" in detail for detail in context[1].decoded)
+        assert any("APDU=80CA006600 -> SW=6A88" in detail for detail in context[1].decoded)
+        dual_unsupported = (
+            "Card Recognition Data object 0066 was not returned",
+            "This optional capability result is unrelated to TAR existence, MSL, or PoR support",
+            "Attempt ISO interindustry APDU=00CA006600 -> SW=6E00 (Class byte not supported)",
+            "Attempt UICC/SIM telecom APDU=80CA006600 -> SW=6E00 (Class byte not supported)",
+        )
+        assert summarize_tar_context_response(
+            "GET DATA card recognition data", APDUResponse(b"", 0x6E, 0), dual_unsupported
+        ) == ("GET DATA object 0066 is not exposed by the tested command classes; "
+              "attempts=ISO=6E00, telecom=6E00; no TAR/MSL/PoR conclusion")
         packet = CommandPacket(bytes.fromhex("000000"))
         scan_rows = [
             ("RAM", f"{index:06X}", packet, APDUResponse(b"", 0x62, 0), None)
@@ -2542,11 +2563,12 @@ def run_self_tests() -> int:
         get_data = decode_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00)
         )
-        assert "not supported" in get_data[0] and "unrelated to TAR" in get_data[1]
+        assert "object 0066" in get_data[0] and "unrelated to TAR" in get_data[1]
         get_data_short = summarize_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00), get_data
         )
-        assert get_data_short == "GET DATA card-recognition object unavailable (6D00); unrelated to TAR/MSL/PoR"
+        assert get_data_short == ("GET DATA object 0066 is not exposed by the tested command classes; "
+                                  "SW=6D00; no TAR/MSL/PoR conclusion")
 
         recognition = bytes.fromhex("660A4602010273044702AABB")
         recognition_decoded = decode_card_recognition_data(recognition)
@@ -2574,8 +2596,8 @@ def run_self_tests() -> int:
         )[1]
         assert fallback.response == APDUResponse(recognition, 0x90, 0)
         assert fallback.command == bytes.fromhex("80CA006600")
-        assert any("CLA=00->SW=6E00, CLA=80->SW=9000" in detail
-                   for detail in fallback.decoded)
+        assert any("APDU=00CA006600 -> SW=6E00" in detail for detail in fallback.decoded)
+        assert any("APDU=80CA006600 -> SW=9000" in detail for detail in fallback.decoded)
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
