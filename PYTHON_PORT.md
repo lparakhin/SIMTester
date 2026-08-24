@@ -68,6 +68,12 @@ Running `python simtester.py` now shows only the four primary test workflows:
 3. APDU scanning at level 1 or level 2.
 4. OTA fuzzing of PID, DCS, and UDHI values (common values or brute force).
 
+Standard fuzzing adds two explicitly labeled unprotected submit-mode PoR probes
+to the original matrix. Quick known-TAR scans use the common RAM/WIB/S@T/RFM
+values `000000`, `000001`, `505348`, `534054`, `B00001`, and `B00010` across
+keysets 1 through 6 by default; full-corpus and custom keyset scans remain
+available.
+
 Lower-level packet and automation commands remain available as CLI subcommands.
 Reader discovery and card connection failures are reported as short actionable
 errors (for example, asking the user to insert the card) rather than tracebacks.
@@ -135,7 +141,7 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the dual-answer build reports `uicc-compact-expanded-v5`.
+being executed, and the current build reports `popular-tar-keysets-v6`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as

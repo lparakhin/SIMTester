@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.4"
-BUILD_ID = "uicc-compact-expanded-v5"
+__version__ = "0.3.5"
+BUILD_ID = "popular-tar-keysets-v6"
 
 
 class PacketError(ValueError):
@@ -128,6 +128,12 @@ KNOWN_TAR_GROUPS: dict[str, tuple[str, ...]] = {
     "RFM": tuple("00000A 00000B 00000C 00000D 00004F 000057 000070 000076 000080 000092\n0000B6 0000E2 000203 000304 000503 010001 010101 010203 012345 012347\n060504 100000 111212 212223 260500 313131 385300 3F0000 3F0001 3F0002\n3F0010 3F0011 41444E 414C4F 415256 415345 424950 425058 434354 443231\n474341 47534D 484353 49434D 494D45 4C5041 4D4552 4D4C4D 4E4147 4E5550\n4E5553 4E5650 4F4350 504F53 514F43 524144 524648 524A49 54454C 524F4D\n533347 534143 534441 534F44 53534D 535353 564153 64646D 800001 800002\n800040 800041 B00000 B00001 B00002 B00003 B0000F B00010 B00011 B00012\nB00013 B00020 B00021 B00030 B00040 B00041 B00042 B00050 B000F1 B00120\nB00140 B00141 B00142 B00143 B00144 B00145 B11000 B20100 B20102 BAFE02\nC00000 C0013D C001AA C001AB C001AD D00003 EED200 EED201 EEE200 EEE201\nFFFF01 FFFFFF".split()),  # RFM/vendor applet candidates
 }
 
+# High-value defaults used by the original SIMTester "poke" workflow plus the
+# two standardized browser TARs.  They are tried first when an operator wants a
+# quick scan; the complete corpus remains available for exhaustive scans.
+POPULAR_TARS = ("000000", "000001", "505348", "534054", "B00001", "B00010")
+POPULAR_KEYSETS = (1, 2, 3, 4, 5, 6)
+
 
 def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> Iterator[tuple[str, CommandPacket]]:
     """Yield labeled OTA packets for the curated S@T, WIB, RAM and vendor corpus."""
@@ -137,6 +143,16 @@ def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> I
             raise ValueError(f"unknown TAR group {group}; choose RAM, WIB, SAT or RFM")
         for value in KNOWN_TAR_GROUPS[group]:
             yield group, CommandPacket(bytes.fromhex(value), keyset=keyset, user_data=b"\0" * 5)
+
+
+def known_tar_keyset_packets(keysets: Iterable[int], groups: Iterable[str] | None = None,
+                             *, popular_only: bool = False) -> Iterator[tuple[str, CommandPacket]]:
+    """Yield known or popular TAR probes across multiple OTA keysets."""
+    wanted = set(POPULAR_TARS) if popular_only else None
+    for keyset in keysets:
+        for group, packet in known_tar_packets(keyset, groups):
+            if wanted is None or packet.tar.hex().upper() in wanted:
+                yield f"{group}/K{keyset}", packet
 
 
 def _tlv(tag: int, value: bytes) -> bytes:
@@ -179,9 +195,17 @@ FUZZER_PROFILES = (
     (3, 3, 3, True, True),
 )
 
+# Additional MSL=0 probes vary only the PoR delivery mode.  They do not add a
+# counter, checksum, or ciphering to the command and are therefore safe to
+# classify as unprotected even when the requested response itself is ciphered.
+UNSECURED_POR_PROFILES = (
+    ("U-SUBMIT", False, True),
+    ("U-SUBMIT-CIPHER-POR", True, True),
+)
+
 
 def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
-    """Generate the original 17 standard fuzzing mechanisms."""
+    """Generate the original 17 mechanisms plus explicit MSL=0 PoR modes."""
     for tar in tars:
         tar_bytes = bytes.fromhex(tar)
         for keyset in keysets:
@@ -191,6 +215,11 @@ def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iter
                     counter_management=counter, kic_algorithm=kic,
                     kid_algorithm=kid, request_por=por, cipher_por=cipher_por,
                     cryptographic_checksum=kid != 0, ciphering=kic != 0,
+                )
+            for label, cipher_por, submit in UNSECURED_POR_PROFILES:
+                yield f"{label}/K{keyset}", CommandPacket(
+                    tar_bytes, keyset, user_data=b"\0" * 5, request_por=True,
+                    cipher_por=cipher_por, por_mode_submit=submit,
                 )
 
 
@@ -1570,13 +1599,15 @@ def _run_known_tar_scan(reader: int, keyset: int,
         (group, ensure_por_requested(packet))
         for group, packet in supplied_probes
     ]
+    active_keysets = sorted({packet.keyset for _, packet in probe_list})
+    keyset_display = ",".join(map(str, active_keysets)) or str(keyset)
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
     results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
     context_results: list[TARContextResult] = []
     errors = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
-          f"{reader_names[reader]}; keyset {keyset}; "
+          f"{reader_names[reader]}; keysets {keyset_display}; "
           f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
     try:
         print("Read-only card context probes:", flush=True)
@@ -1955,6 +1986,11 @@ def run_self_tests() -> int:
         assert len(KNOWN_TAR_GROUPS["SAT"]) == 2
         assert len(KNOWN_TAR_GROUPS["WIB"]) == 20
         assert sum(map(len, KNOWN_TAR_GROUPS.values())) == 135
+        assert POPULAR_TARS == ("000000", "000001", "505348", "534054", "B00001", "B00010")
+        popular = list(known_tar_keyset_packets((1, 3), popular_only=True))
+        assert len(popular) == len(POPULAR_TARS) * 2
+        assert {packet.keyset for _, packet in popular} == {1, 3}
+        assert {packet.tar.hex().upper() for _, packet in popular} == set(POPULAR_TARS)
         packet = next(known_tar_packets(groups=("SAT",)))[1]
         assert packet.tar == bytes.fromhex("505348")
         envelope = build_sms_pp_download_apdu(packet)
@@ -1964,8 +2000,11 @@ def run_self_tests() -> int:
     @check("standard fuzzer matrix and OTA envelope variants")
     def _fuzzing_modes() -> None:
         packets = list(standard_fuzzer_packets(("B00010",), (1,)))
-        assert len(packets) == 17
-        assert packets[0][0] == "F00/K1" and packets[-1][0] == "F16/K1"
+        assert len(packets) == 19
+        assert packets[0][0] == "F00/K1" and packets[16][0] == "F16/K1"
+        assert packets[-2][0] == "U-SUBMIT/K1"
+        assert packets[-1][0] == "U-SUBMIT-CIPHER-POR/K1"
+        assert all(requested_msl(packet).startswith("MSL=0") for _, packet in packets[-2:])
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain
@@ -2281,27 +2320,34 @@ def interactive_menu() -> int:
             if choice == "0":
                 return 0
             if choice == "1":
-                tars = input("TARs comma-separated [000000,B00001,B00010]: ").strip()
-                tar_list = [value.strip().upper() for value in (tars or "000000,B00001,B00010").split(",")]
+                default_tars = ",".join(POPULAR_TARS)
+                tars = input(f"TARs comma-separated [{default_tars}]: ").strip()
+                tar_list = [value.strip().upper() for value in (tars or default_tars).split(",")]
                 keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
-                keyset_list = [int(value) for value in (keysets or "1,2,3,4,5,6").split(",")]
+                keyset_list = [int(value) for value in (keysets or ",".join(map(str, POPULAR_KEYSETS))).split(",")]
                 reader = _select_reader()
                 _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
                                     title="STANDARD FUZZING")
             elif choice == "2":
                 mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
-                keyset = _read_int("Keyset [0]: ")
+                entered_keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
+                keysets = tuple(int(value) for value in
+                                (entered_keysets or ",".join(map(str, POPULAR_KEYSETS))).split(","))
                 if mode == "range":
                     low = _read_int("First TAR hex [000000]: ", base=16)
                     high = _read_int("Last TAR hex [0000FF]: ", 0xFF, 16)
                     reader = _select_reader()
-                    probes = (("RANGE", packet) for packet in build_tar_packets([(low, high)], keyset=keyset))
-                    _run_known_tar_scan(reader, keyset, probes=probes, title="TAR RANGE SCAN")
+                    probes = ((f"RANGE/K{keyset}", packet) for keyset in keysets
+                              for packet in build_tar_packets([(low, high)], keyset=keyset))
+                    _run_known_tar_scan(reader, keysets[0], probes=probes, title="TAR RANGE SCAN")
                 else:
                     groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
                     selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                    quick = input("Popular TARs only? [Y/n]: ").strip().lower() != "n"
                     reader = _select_reader()
-                    _run_known_tar_scan(reader, keyset, selected)
+                    probes = known_tar_keyset_packets(keysets, selected, popular_only=quick)
+                    _run_known_tar_scan(reader, keysets[0], probes=probes,
+                                        title="POPULAR TAR SCAN" if quick else "KNOWN TAR SCAN")
             elif choice == "3":
                 level = _read_int("APDU scan level [1]: ", 1)
                 _run_scan(_select_reader(), level == 2)
@@ -2333,12 +2379,16 @@ def make_parser() -> argparse.ArgumentParser:
     scan = commands.add_parser("scan-apdu")
     scan.add_argument("--reader", type=int, default=0); scan.add_argument("--level2", action="store_true")
     known = commands.add_parser("known-tars")
-    known.add_argument("--keyset", type=int, default=0)
+    known.add_argument("--keyset", type=int, help="single keyset (legacy alias)")
+    known.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
     known.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
+    known.add_argument("--popular-only", action="store_true")
     known_scan = commands.add_parser("scan-known-tars")
     known_scan.add_argument("--reader", type=int, default=0)
-    known_scan.add_argument("--keyset", type=int, default=0)
+    known_scan.add_argument("--keyset", type=int, help="single keyset (legacy alias)")
+    known_scan.add_argument("--keysets", default=",".join(map(str, POPULAR_KEYSETS)))
     known_scan.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
+    known_scan.add_argument("--popular-only", action="store_true")
     commands.add_parser("menu")
     commands.add_parser("self-test")
     return parser
@@ -2361,13 +2411,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected = None if args.groups.upper() == "ALL" else tuple(
             group.strip().upper() for group in args.groups.split(",")
         )
-        for group, packet in known_tar_packets(args.keyset, selected):
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        for group, packet in known_tar_keyset_packets(keysets, selected,
+                                                       popular_only=args.popular_only):
             print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
     elif args.command == "scan-known-tars":
         selected = None if args.groups.upper() == "ALL" else tuple(
             group.strip().upper() for group in args.groups.split(",")
         )
-        _run_known_tar_scan(args.reader, args.keyset, selected)
+        keysets = (args.keyset,) if args.keyset is not None else tuple(
+            int(value) for value in args.keysets.split(",")
+        )
+        probes = known_tar_keyset_packets(keysets, selected, popular_only=args.popular_only)
+        _run_known_tar_scan(args.reader, keysets[0], probes=probes,
+                            title="POPULAR TAR SCAN" if args.popular_only else "KNOWN TAR SCAN")
     return 0
 
 
