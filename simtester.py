@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.1"
-BUILD_ID = "uicc-status-le-v2"
+__version__ = "0.3.2"
+BUILD_ID = "uicc-fcp-decode-v3"
 
 
 class PacketError(ValueError):
@@ -1127,6 +1127,108 @@ class TARContextResult:
     response: APDUResponse
     analysis: ResponseAnalysis
     exchanges: tuple[tuple[bytes, APDUResponse], ...] = ()
+    decoded: tuple[str, ...] = ()
+
+
+def _ber_tlvs(data: bytes) -> list[tuple[int, bytes]]:
+    """Decode the definite-length BER-TLV subset used by UICC FCP templates."""
+    result = []
+    offset = 0
+    while offset < len(data):
+        tag = data[offset]
+        offset += 1
+        if tag & 0x1F == 0x1F:
+            if offset >= len(data):
+                raise PacketError("truncated multi-byte BER tag")
+            tag = tag << 8 | data[offset]
+            offset += 1
+        if offset >= len(data):
+            raise PacketError("missing BER length")
+        length = data[offset]
+        offset += 1
+        if length == 0x81:
+            if offset >= len(data):
+                raise PacketError("truncated BER length")
+            length = data[offset]
+            offset += 1
+        elif length == 0x82:
+            if offset + 2 > len(data):
+                raise PacketError("truncated BER length")
+            length = int.from_bytes(data[offset:offset + 2], "big")
+            offset += 2
+        elif length & 0x80:
+            raise PacketError("unsupported BER length form")
+        if offset + length > len(data):
+            raise PacketError("BER value exceeds response length")
+        result.append((tag, data[offset:offset + length]))
+        offset += length
+    return result
+
+
+def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
+    """Decode standardized ETSI UICC STATUS FCP fields conservatively."""
+    if not data:
+        return ("No STATUS response data",)
+    try:
+        outer = _ber_tlvs(data)
+    except PacketError as exc:
+        return (f"Malformed STATUS BER-TLV: {exc}", f"Raw data={data.hex().upper()}")
+    if len(outer) != 1 or outer[0][0] != 0x62:
+        return ("Response is not an FCP template (tag 62)", f"Raw data={data.hex().upper()}")
+    details = [f"FCP template: {len(outer[0][1])} byte(s)"]
+    lifecycle = {
+        0x01: "creation", 0x03: "initialization", 0x04: "operational/deactivated",
+        0x05: "operational/activated", 0x0C: "termination",
+    }
+    key_refs = {0x01: "PIN1", 0x81: "PIN2"}
+    try:
+        fields = _ber_tlvs(outer[0][1])
+        for tag, value in fields:
+            raw = value.hex().upper()
+            if tag == 0x82:
+                kind = "DF/ADF" if value and value[0] & 0x38 == 0x38 else "EF/other"
+                shareable = "shareable" if value and value[0] & 0x40 else "not shareable"
+                details.append(f"File descriptor={raw} ({kind}, {shareable})")
+            elif tag == 0x83 and len(value) == 2:
+                fid = int.from_bytes(value, "big")
+                details.append(f"File identifier={fid:04X}" + (" (MF)" if fid == 0x3F00 else ""))
+            elif tag == 0x8A and value:
+                state = lifecycle.get(value[0], "ETSI/ISO profile-specific state")
+                details.append(f"Life-cycle status={value[0]:02X} ({state})")
+            elif tag == 0x8B:
+                details.append(f"Security attributes (compact)={raw}")
+            elif tag == 0xA5:
+                for nested_tag, nested_value in _ber_tlvs(value):
+                    nested_raw = nested_value.hex().upper()
+                    if nested_tag == 0x80:
+                        details.append(f"UICC characteristics={nested_raw}")
+                    elif nested_tag == 0x83:
+                        details.append(f"Available memory={int.from_bytes(nested_value, 'big')} byte(s)")
+                    else:
+                        details.append(f"Proprietary information tag {nested_tag:02X}={nested_raw}")
+            elif tag == 0xC6:
+                pin_fields = _ber_tlvs(value)
+                qualifier = next((item for item in pin_fields if item[0] == 0x90), None)
+                references = [item[1][0] for item in pin_fields if item[0] == 0x83 and item[1]]
+                names = [key_refs.get(ref, f"ADM{ref - 9}" if 0x0A <= ref <= 0x0E else f"REF-{ref:02X}")
+                         for ref in references]
+                qualifier_text = qualifier[1].hex().upper() if qualifier else "missing"
+                details.append(f"PIN status template: qualifier={qualifier_text}, references={','.join(names) or 'none'}")
+            else:
+                details.append(f"FCP tag {tag:02X}={raw}")
+    except PacketError as exc:
+        details.append(f"Malformed nested FCP BER-TLV: {exc}")
+    return tuple(details)
+
+
+def decode_tar_context_response(name: str, response: APDUResponse) -> tuple[str, ...]:
+    """Return human-readable context data/status details without overclaiming."""
+    if name.startswith("STATUS") and response.sw == 0x9000:
+        return decode_uicc_status_data(response.data)
+    if name.startswith("GET DATA") and response.sw == 0x6D00:
+        return ("INS CA is not implemented for this CLA; GET DATA is optional in this UICC context",
+                "This result is unrelated to TAR existence, MSL, or PoR support")
+    return ()
 
 
 def analyze_tar_context_response(name: str, command: bytes,
@@ -1166,7 +1268,8 @@ def probe_tar_scan_context(transport: CardTransport,
     for name, command in commands:
         response, exchanges = _card_command_trace(transport, command)
         results.append(TARContextResult(
-            name, command, response, analyze_tar_context_response(name, command, response), exchanges
+            name, command, response, analyze_tar_context_response(name, command, response),
+            exchanges, decode_tar_context_response(name, response)
         ))
     return results
 
@@ -1350,6 +1453,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
                           f"SW={exchange_response.sw:04X} - {info.meaning}", flush=True)
                 print(f"    ANALYSIS={context.analysis.conclusion}; "
                       f"NEXT={context.analysis.next_step}", flush=True)
+                for detail in context.decoded:
+                    print(f"    DECODE={detail}", flush=True)
         except Exception as exc:
             errors += 1
             print(f"  Context probe error: {exc}; continuing with TAR probes", flush=True)
@@ -1437,6 +1542,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
               f"DATA={context.response.data.hex().upper() or '<empty>'} "
               f"SEVERITY={context.analysis.severity} - {info.meaning}; "
               f"{context.analysis.conclusion}", flush=True)
+        for detail in context.decoded:
+            print(f"    {detail}", flush=True)
     if not context_results:
         print("  unavailable", flush=True)
     print("MSL coverage:", flush=True)
@@ -1759,6 +1866,20 @@ def run_self_tests() -> int:
         baseline, count, findings = classify_tar_scan_results(scan_rows)
         assert baseline == (0x6200, b"") and count == 3
         assert len(findings) == 1 and findings[0][4] is not None
+        logged_fcp = bytes.fromhex(
+            "62298202782183023F00A509800171830400042DD08A01058B032F0612"
+            "C60C90016083010183018183010A"
+        )
+        decoded = decode_uicc_status_data(logged_fcp)
+        assert "FCP template: 41 byte(s)" in decoded
+        assert "File identifier=3F00 (MF)" in decoded
+        assert "Life-cycle status=05 (operational/activated)" in decoded
+        assert "Available memory=273872 byte(s)" in decoded
+        assert "PIN status template: qualifier=60, references=PIN1,PIN2,ADM1" in decoded
+        get_data = decode_tar_context_response(
+            "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00)
+        )
+        assert "optional" in get_data[0] and "unrelated to TAR" in get_data[1]
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
