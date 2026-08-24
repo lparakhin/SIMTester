@@ -504,6 +504,28 @@ def _read_int(prompt: str, default: int = 0, base: int = 10) -> int:
     return default if not value else int(value, base)
 
 
+def _select_reader(reader_names: Sequence[str] | None = None,
+                   input_fn: Callable[[str], str] = input) -> int:
+    """Display available PC/SC readers and return a validated selection."""
+    names = list(PCSCTransport.readers() if reader_names is None else reader_names)
+    if not names:
+        raise RuntimeError("No PC/SC smart-card readers were found")
+    print("\nAvailable SIM readers:")
+    for index, name in enumerate(names):
+        print(f"  {index}. {name}")
+    while True:
+        value = input_fn("Select reader [0]: ").strip()
+        try:
+            selected = 0 if not value else int(value)
+        except ValueError:
+            print("Enter a numeric reader index.")
+            continue
+        if 0 <= selected < len(names):
+            print(f"Selected reader {selected}: {names[selected]}")
+            return selected
+        print(f"Reader index must be between 0 and {len(names) - 1}.")
+
+
 def _print_response(packet: ResponsePacket) -> None:
     print(json.dumps({"tar": packet.tar.hex().upper() if packet.tar else None,
                       "counter": packet.counter, "padding_counter": packet.padding_counter,
@@ -826,6 +848,12 @@ def run_self_tests() -> int:
         else:
             raise AssertionError("missing card connection should fail")
 
+    @check("reader selection validates and returns the chosen reader")
+    def _reader_selection() -> None:
+        answers = iter(("x", "9", "1"))
+        selected = _select_reader(("Reader A", "Reader B"), lambda _prompt: next(answers))
+        assert selected == 1
+
     failures = 0
     for name, function in checks:
         try:
@@ -858,29 +886,30 @@ def interactive_menu() -> int:
                 tar_list = [value.strip().upper() for value in (tars or "000000,B00001,B00010").split(",")]
                 keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
                 keyset_list = [int(value) for value in (keysets or "1,2,3,4,5,6").split(",")]
-                reader = _read_int("Reader index [0]: ")
+                reader = _select_reader()
                 _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
                                     title="STANDARD FUZZING")
             elif choice == "2":
                 mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
                 keyset = _read_int("Keyset [0]: ")
-                reader = _read_int("Reader index [0]: ")
                 if mode == "range":
                     low = _read_int("First TAR hex [000000]: ", base=16)
                     high = _read_int("Last TAR hex [0000FF]: ", 0xFF, 16)
+                    reader = _select_reader()
                     probes = (("RANGE", packet) for packet in build_tar_packets([(low, high)], keyset=keyset))
                     _run_known_tar_scan(reader, keyset, probes=probes, title="TAR RANGE SCAN")
                 else:
                     groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
                     selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                    reader = _select_reader()
                     _run_known_tar_scan(reader, keyset, selected)
             elif choice == "3":
                 level = _read_int("APDU scan level [1]: ", 1)
-                _run_scan(_read_int("Reader index [0]: "), level == 2)
+                _run_scan(_select_reader(), level == 2)
             elif choice == "4":
                 tar = input("TAR [B00010]: ").strip().upper() or "B00010"
                 keyset = _read_int("Keyset [0]: ")
-                reader = _read_int("Reader index [0]: ")
+                reader = _select_reader()
                 bruteforce = input("Bruteforce all PID/DCS values? [y/N]: ").strip().lower() == "y"
                 _run_ota_fuzzing(reader, tar, keyset, bruteforce)
             else:

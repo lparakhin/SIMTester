@@ -11,6 +11,7 @@
 > can be scanned from menu option 2 or `scan-known-tars` (`known-tars` previews them).
 > The interactive menu is limited to four workflows: standard fuzzing, TAR scanning,
 > APDU scanning, and OTA fuzzing.
+> Each workflow displays a named SIM-reader selection menu before connecting.
 
 SIMTester assess SIM card security in two dimensions:
 

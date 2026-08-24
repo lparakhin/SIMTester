@@ -71,6 +71,8 @@ Running `python simtester.py` now shows only the four primary test workflows:
 Lower-level packet and automation commands remain available as CLI subcommands.
 Reader discovery and card connection failures are reported as short actionable
 errors (for example, asking the user to insert the card) rather than tracebacks.
+Before every interactive workflow, the tool lists all discovered PC/SC readers
+by name and validates the selected reader index.
 
 There is nothing to install and no second Python source file. Examples:
 
