@@ -26,7 +26,7 @@
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; current scans identify build `tar-existence-any-msl-v8`.
+> Use `python simtester.py --version`; current scans identify build `unsecured-msl-matrix-v9`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
 > Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
 > field-level decode with the raw response retained for auditing. UICC GET DATA
@@ -41,6 +41,10 @@
 > TAR scans test every response-capable security profile by default and classify
 > each TAR as CONFIRMED PRESENT, REPORTED UNKNOWN, or INCONCLUSIVE. Confirmation
 > requires a structurally valid PoR whose returned TAR matches the probe.
+> Standard and all-MSL TAR scans also send the explicit unsecured SPI1 matrix:
+> `00,01,02,04,05,06,08,09,0A,0C,0D,0E,10,11,14,15,18,19,1C,1D`.
+> CC bytes are zero-filled and declared ciphering is not applied, so these are
+> clearly labeled detection probes rather than genuinely secured commands.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:

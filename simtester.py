@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.7"
-BUILD_ID = "tar-existence-any-msl-v8"
+__version__ = "0.3.8"
+BUILD_ID = "unsecured-msl-matrix-v9"
 
 
 class PacketError(ValueError):
@@ -133,6 +133,10 @@ KNOWN_TAR_GROUPS: dict[str, tuple[str, ...]] = {
 # quick scan; the complete corpus remains available for exhaustive scans.
 POPULAR_TARS = ("000000", "000001", "505348", "534054", "B00001", "B00010")
 POPULAR_KEYSETS = (1, 2, 3, 4, 5, 6)
+UNSECURED_MSL_VALUES = (
+    0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0C,
+    0x0D, 0x0E, 0x10, 0x11, 0x14, 0x15, 0x18, 0x19, 0x1C, 0x1D,
+)
 
 
 def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> Iterator[tuple[str, CommandPacket]]:
@@ -259,11 +263,32 @@ UNSECURED_POR_PROFILES = (
 )
 
 
-def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
-    """Generate the original 17 mechanisms plus explicit MSL=0 PoR modes."""
+def unsecured_msl_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Generate the requested raw SPI1/MSL probes without real command security.
+
+    Checksum fields are zero-filled and ciphering is declared but not applied;
+    these are detection probes, never authenticated production commands.
+    """
     for tar in tars:
         tar_bytes = bytes.fromhex(tar)
         for keyset in keysets:
+            for msl in UNSECURED_MSL_VALUES:
+                yield f"MSL={msl:02X}/K{keyset}", CommandPacket(
+                    tar_bytes, keyset, user_data=b"\0" * 5,
+                    counter_management=(msl >> 3) & 3,
+                    request_por=True, fake_spi1=msl,
+                    cryptographic_checksum=bool(msl & 0x02),
+                    ciphering=bool(msl & 0x04),
+                )
+
+
+def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Generate the original 17 mechanisms plus explicit MSL=0 PoR modes."""
+    tar_list = tuple(tars)
+    keyset_list = tuple(keysets)
+    for tar in tar_list:
+        tar_bytes = bytes.fromhex(tar)
+        for keyset in keyset_list:
             for index, (counter, kic, kid, por, cipher_por) in enumerate(FUZZER_PROFILES):
                 yield f"F{index:02d}/K{keyset}", CommandPacket(
                     tar_bytes, keyset, counter=0 if counter == 0 else 1, user_data=b"\0" * 5,
@@ -276,6 +301,7 @@ def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iter
                     tar_bytes, keyset, user_data=b"\0" * 5, request_por=True,
                     cipher_por=cipher_por, por_mode_submit=submit,
                 )
+    yield from unsecured_msl_packets(tar_list, keyset_list)
 
 
 def tar_msl_probe_packets(
@@ -354,6 +380,19 @@ class ResponsePacket:
 
 
 def requested_msl(packet: CommandPacket) -> str:
+    if packet.fake_spi1 is not None:
+        attributes = []
+        if packet.fake_spi1 & 0x01:
+            attributes.append("RFU-bit-set")
+        if packet.fake_spi1 & 0x02:
+            attributes.append("zero-filled-CC")
+        if packet.fake_spi1 & 0x04:
+            attributes.append("ciphering-declared-not-applied")
+        counter = (packet.fake_spi1 >> 3) & 3
+        if counter:
+            attributes.append(f"counter-mode-{counter}")
+        detail = ", ".join(attributes) or "no command security"
+        return f"MSL={packet.fake_spi1:02X} (unsecured SPI1 probe: {detail})"
     protections = []
     if packet.cryptographic_checksum:
         protections.append("CC")
@@ -362,6 +401,11 @@ def requested_msl(packet: CommandPacket) -> str:
     if packet.counter_management:
         protections.append(f"counter-mode-{packet.counter_management}")
     return "MSL=0 (no command security)" if not protections else "MSL>0 (" + ", ".join(protections) + ")"
+
+
+def is_unsecured_probe(packet: CommandPacket) -> bool:
+    """Return whether this command deliberately lacks applied command security."""
+    return packet.fake_spi1 is not None or requested_msl(packet).startswith("MSL=0")
 
 
 def decode_por_status(status: int) -> str:
@@ -1767,6 +1811,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
                   for group, packet in supplied_probes]
     active_keysets = sorted({packet.keyset for _, packet in probe_list})
     keyset_display = ",".join(map(str, active_keysets)) or str(keyset)
+    active_unsecured_msl = sorted({packet.fake_spi1 for _, packet in probe_list
+                                   if packet.fake_spi1 is not None})
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
     results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
@@ -1776,6 +1822,9 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keysets {keyset_display}; "
           f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
+    if active_unsecured_msl:
+        print("Unsecured SPI1/MSL probes: " +
+              ", ".join(f"MSL={value:02X}" for value in active_unsecured_msl), flush=True)
     try:
         print("Read-only card context probes:", flush=True)
         try:
@@ -1856,7 +1905,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     parsed_results = [result for result in results if result[4] is not None]
     baseline_signature, baseline_count, interesting_results = classify_tar_scan_results(results)
     insecure = [result for result in parsed_results
-                if result[4].status_code == 0 and requested_msl(result[2]).startswith("MSL=0")]
+                if result[4].status_code == 0 and is_unsecured_probe(result[2])]
     por_requested = sum(1 for result in results if result[2].request_por)
     por_received = sum(1 for result in parsed_results if result[2].request_por)
     msl_attempts = Counter(requested_msl(result[2]) for result in results)
@@ -1868,6 +1917,9 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"3GPP/ETSI APDU structures validated: {apdu_validations}/{len(probe_list)}", flush=True)
+    if active_unsecured_msl:
+        print("Unsecured MSL matrix attempted: " +
+              ", ".join(f"MSL={value:02X}" for value in active_unsecured_msl), flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
     print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
     if baseline_count:
@@ -1898,14 +1950,15 @@ def _run_known_tar_scan(reader: int, keyset: int,
     for level, attempts in msl_attempts.items():
         print(f"  {level}: responses={attempts}, successful-PoR={msl_successes[level]}", flush=True)
     if insecure:
-        print(f"WARNING: {len(insecure)} UNSECURE MSL=0 command(s) succeeded", flush=True)
+        print(f"WARNING: {len(insecure)} deliberately UNSECURED MSL/SPI1 probe(s) returned successful PoR",
+              flush=True)
     print(f"Interesting differential/PoR findings: {len(interesting_results)}", flush=True)
     for group, tar, packet, response, parsed in interesting_results:
         info = decode_status_word(response.sw1, response.sw2)
         ota = (f" OTA-RSC={parsed.status_code:02X}({decode_por_status(parsed.status_code)})"
                if parsed is not None else " no-PoR")
         warning = " WARNING=UNSECURE" if (parsed is not None and parsed.status_code == 0
-                                          and requested_msl(packet).startswith("MSL=0")) else ""
+                                          and is_unsecured_probe(packet)) else ""
         print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
               f"DATA={response.data.hex().upper() or '<empty>'} {requested_msl(packet)}"
               f"{warning} - {info.meaning}", flush=True)
@@ -2192,19 +2245,24 @@ def run_self_tests() -> int:
     @check("standard fuzzer matrix and OTA envelope variants")
     def _fuzzing_modes() -> None:
         packets = list(standard_fuzzer_packets(("B00010",), (1,)))
-        assert len(packets) == 19
+        assert len(packets) == 19 + len(UNSECURED_MSL_VALUES)
         assert packets[0][0] == "F00/K1" and packets[16][0] == "F16/K1"
-        assert packets[-2][0] == "U-SUBMIT/K1"
-        assert packets[-1][0] == "U-SUBMIT-CIPHER-POR/K1"
-        assert all(requested_msl(packet).startswith("MSL=0") for _, packet in packets[-2:])
+        assert packets[17][0] == "U-SUBMIT/K1"
+        assert packets[18][0] == "U-SUBMIT-CIPHER-POR/K1"
+        assert all(requested_msl(packet).startswith("MSL=0") for _, packet in packets[17:19])
         assert not packets[0][1].request_por and packets[1][1].request_por
         assert packets[0][1].to_bytes() != packets[1][1].to_bytes()
         tar_profiles = list(tar_msl_probe_packets((("RFM/K1", packets[0][1]),)))
-        assert len(tar_profiles) == 16
+        assert len(tar_profiles) == 16 + len(UNSECURED_MSL_VALUES)
         assert all(packet.request_por and not packet.por_mode_submit for _, packet in tar_profiles)
         assert any(requested_msl(packet).startswith("MSL=0") for _, packet in tar_profiles)
         assert any("CC" in requested_msl(packet) for _, packet in tar_profiles)
         assert any("ciphering" in requested_msl(packet) for _, packet in tar_profiles)
+        raw_msl = [(label, packet) for label, packet in packets if label.startswith("MSL=")]
+        assert [packet.fake_spi1 for _, packet in raw_msl] == list(UNSECURED_MSL_VALUES)
+        assert [packet.to_bytes()[6] for _, packet in raw_msl] == list(UNSECURED_MSL_VALUES)
+        assert requested_msl(raw_msl[-1][1]).startswith("MSL=1D (unsecured SPI1 probe:")
+        assert all(is_unsecured_probe(packet) for _, packet in raw_msl)
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain

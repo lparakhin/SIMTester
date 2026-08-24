@@ -79,9 +79,11 @@ the tool validates ENVELOPE CLA/INS/P1/P2/Lc, the `D1` TLV hierarchy,
 network-to-UICC identities, SMS-DELIVER PID/DCS/UDL, and secured-packet lengths.
 Response correlation distinguishes repeated parser warnings and empty
 submit-mode acknowledgements from parseable PoR evidence.
-Known and ranged TAR scans now expand each TAR/keyset over all 16
-response-capable profiles from the standard matrix, covering MSL=0, counter,
-checksum, and ciphering declarations. A TAR is confirmed only when a parseable
+Known and ranged TAR scans now expand each TAR/keyset over the 16 original
+response-capable profiles plus 20 explicit unsecured SPI1/MSL values:
+`00, 01, 02, 04, 05, 06, 08, 09, 0A, 0C, 0D, 0E, 10, 11, 14, 15, 18, 19, 1C, 1D`.
+The matrix covers counter, checksum, ciphering, and RFU-bit declarations, but
+does not apply real ciphering and uses zero-filled checksum bytes. A TAR is confirmed only when a parseable
 PoR returns the same TAR with an RSC other than `09`; matching RSC `09` is shown
 as `REPORTED UNKNOWN`, and transport-only status words remain `INCONCLUSIVE`.
 The menu and `scan-known-tars --single-profile` retain a fast basic-profile mode.
@@ -153,7 +155,7 @@ into a dominant transport/parser baseline instead of listing every TAR as found.
 TAR scan headers include the tool version and build identifier. If output still
 says `GET STATUS application templates` or `Interesting findings: 135`, it came
 from an older copied script; `python simtester.py --version` identifies the file
-being executed, and the current build reports `tar-existence-any-msl-v8`.
+being executed, and the current build reports `unsecured-msl-matrix-v9`.
 Successful STATUS FCP data is decoded into its file descriptor and identifier,
 life-cycle state, UICC characteristics, available memory, compact security
 attributes, and PIN-key references. Unknown or malformed TLVs remain visible as
