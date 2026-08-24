@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
@@ -211,6 +212,14 @@ class PCSCTransport:
         data, sw1, sw2 = self.connection.transmit(list(apdu))
         return APDUResponse(bytes(data), sw1, sw2)
 
+    def reconnect(self) -> None:
+        """Reconnect after a transient PC/SC communication failure."""
+        try:
+            self.connection.disconnect()
+        except Exception:
+            pass
+        self.connection.connect()
+
     def close(self) -> None:
         self.connection.disconnect()
 
@@ -221,23 +230,55 @@ class ScanFinding:
     response: APDUResponse
 
 
-APDUTrace = Callable[[int, int, bytes, APDUResponse | None, bool | None], None]
+APDUTraceValue = APDUResponse | Exception | None
+APDUTrace = Callable[[int, int, bytes, APDUTraceValue, bool | None], None]
 
 
 def scan_apdus(transport: CardTransport, *, level2: bool = False,
                interesting: Callable[[APDUResponse], bool] | None = None,
-               trace: APDUTrace | None = None) -> Iterator[ScanFinding]:
+               trace: APDUTrace | None = None, retries: int = 2,
+               max_consecutive_errors: int = 10) -> Iterator[ScanFinding]:
     """Probe CLA/INS values, tracing every exchange and yielding supported ones."""
+    if retries < 0 or max_consecutive_errors < 1:
+        raise ValueError("retries must be non-negative and max errors must be positive")
     predicate = interesting or (lambda response: response.sw not in {0x6E00, 0x6D00, 0x6881, 0x6882})
     total = 256 * 256 if level2 else 256
     sequence = 0
+    consecutive_errors = 0
     for cla in range(256):
         for instruction in range(256) if level2 else (0,):
             sequence += 1
             command = bytes((cla, instruction, 0, 0))
-            if trace is not None:
-                trace(sequence, total, command, None, None)
-            response = transport.transmit(command)
+            response = None
+            last_error = None
+            for attempt in range(retries + 1):
+                if trace is not None:
+                    trace(sequence, total, command, None, None)
+                try:
+                    response = transport.transmit(command)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    will_retry = attempt < retries
+                    if trace is not None:
+                        trace(sequence, total, command, exc, will_retry)
+                    if will_retry:
+                        reconnect = getattr(transport, "reconnect", None)
+                        if reconnect is not None:
+                            try:
+                                reconnect()
+                            except Exception:
+                                pass
+                        time.sleep(0.1)
+            if response is None:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    raise RuntimeError(
+                        f"scan stopped after {consecutive_errors} consecutive communication errors; "
+                        f"last error: {last_error}"
+                    )
+                continue
+            consecutive_errors = 0
             is_interesting = predicate(response)
             if trace is not None:
                 trace(sequence, total, command, response, is_interesting)
@@ -291,9 +332,14 @@ def _run_scan(reader: int, level2: bool) -> None:
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
 
     def screen_trace(sequence: int, total: int, command: bytes,
-                     response: APDUResponse | None, found: bool | None) -> None:
+                     response: APDUTraceValue, found: bool | None) -> None:
         if response is None:
             print(f"[{sequence:05d}/{total:05d}] TX APDU={command.hex().upper()}", flush=True)
+            return
+        if isinstance(response, Exception):
+            action = "retrying" if found else "SKIPPED"
+            print(f"[{sequence:05d}/{total:05d}] ERROR {type(response).__name__}: "
+                  f"{response} - {action}", flush=True)
             return
         data = response.data.hex().upper() or "<empty>"
         result = "FOUND" if found else "filtered"
@@ -308,8 +354,13 @@ def _run_scan(reader: int, level2: bool) -> None:
             response = finding.response
             print(f"FINDING VALUE={finding.value:04X} SW={response.sw:04X} "
                   f"DATA={response.data.hex().upper() or '<empty>'}", flush=True)
+    except RuntimeError as exc:
+        print(f"SCAN ABORTED: {exc}", flush=True)
     finally:
-        transport.close()
+        try:
+            transport.close()
+        except Exception as exc:
+            print(f"CARD CLOSE ERROR: {exc}", flush=True)
         print(f"SCAN END: {findings} potentially supported APDU values found", flush=True)
 
 
@@ -345,7 +396,7 @@ def run_self_tests() -> int:
 
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
-        trace_log: list[tuple[int, int, bytes, APDUResponse | None, bool | None]] = []
+        trace_log: list[tuple[int, int, bytes, APDUTraceValue, bool | None]] = []
         transport = MockTransport(
             lambda apdu: APDUResponse(b"ok", 0x90, 0) if apdu[0] == 7
             else APDUResponse(b"", 0x6E, 0)
@@ -358,6 +409,21 @@ def run_self_tests() -> int:
         assert trace_log[14][2] == bytes.fromhex("07000000")
         assert trace_log[14][3] is None
         assert trace_log[15][4] is True
+
+    @check("APDU scan retries and skips communication errors")
+    def _apdu_retry() -> None:
+        calls = 0
+
+        def flaky_handler(apdu: bytes) -> APDUResponse:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("temporary reader error")
+            return APDUResponse(b"", 0x6E, 0)
+
+        scanner = scan_apdus(MockTransport(flaky_handler), retries=1)
+        assert list(scanner) == []
+        assert calls == 257
 
     failures = 0
     for name, function in checks:
