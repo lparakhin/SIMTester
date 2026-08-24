@@ -106,10 +106,16 @@ Both ATR sources are checked independently. Their raw matches are filtered to
 telecom indicators (SIM/UICC/USIM/eSIM, GSM/UMTS/LTE/3G/4G/5G, mobile/operator)
 and accepted only when attributed to a recognized major SIM manufacturer;
 payment cards, access badges, and unknown-vendor entries are excluded.
+Major-vendor background is embedded in the script so summaries remain useful
+offline even when both ATR sources are unavailable.
 When a probe returns `6881`, the scanner uses MANAGE CHANNEL to open every
 logical channel offered by the UICC (channels 1 through 19), applies ISO/IEC
 7816-4/ETSI channel CLA encoding, retries the APDU on each channel, records the
 channel in findings, and closes every channel afterward.
+OTA fuzzing performs controlled PID/DCS/UDHI comparisons, identifies which
+parameter changes correlate with status-word changes, separates warning variants
+from the dominant response, measures parseable PoR support, and explicitly avoids
+treating an empty `9000` transport acknowledgement as proof of OTA execution.
 
 There is nothing to install and no second Python source file. Examples:
 

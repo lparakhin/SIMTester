@@ -312,6 +312,9 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
     if response.sw1 == 0x6C:
         return ResponseAnalysis(True, "high", "INS is recognized; only Le is wrong",
                                 f"Retry with Le={response.sw2 or 256}")
+    if response.sw1 == 0x62:
+        return ResponseAnalysis(True, "medium", "Command completed with a warning and non-volatile memory unchanged",
+                                "Compare this parameter set with 9000 variants; do not infer OTA execution without PoR")
     if sw in (0x6700, 0x6A80, 0x6A86, 0x6A87, 0x6A88, 0x6B00):
         return ResponseAnalysis(True, "medium", "CLA/INS likely recognized; parameters or data are invalid",
                                 "Refine P1/P2, Lc, data, and Le without treating this as unsupported")
@@ -585,6 +588,24 @@ VENDOR_MARKERS = (
     (b"VALID", "Valid"), (b"KONA", "KONA I"),
     (b"TIANYU", "Wuhan Tianyu"), (b"DATANG", "Datang"),
 )
+
+# Embedded major-vendor metadata keeps useful attribution available offline;
+# external ATR sources are still used for card-specific matching.
+MAJOR_SIM_VENDOR_INFO = {
+    "Gemplus/Gemalto": "France; Gemplus merged into Gemalto, now part of Thales DIS",
+    "Gemalto/Thales": "Global; Gemalto is now Thales Digital Identity and Security",
+    "Thales": "Global; Thales Digital Identity and Security SIM/eSIM portfolio",
+    "Oberthur/IDEMIA": "France; Oberthur Technologies became IDEMIA",
+    "IDEMIA": "Global; physical SIM, eSIM, and secure connectivity vendor",
+    "Morpho/IDEMIA": "France; Morpho combined with Oberthur to form IDEMIA",
+    "Giesecke+Devrient": "Germany; G+D Mobile Security SIM/eSIM vendor",
+    "Watchdata": "China/Singapore; telecom smart-card and SIM vendor",
+    "Eastcompeace": "China; SIM, eSIM, and telecom smart-card vendor",
+    "Valid": "Global; SIM/eSIM and mobile identity vendor",
+    "KONA I": "South Korea; USIM, eSIM, and secure-element vendor",
+    "Wuhan Tianyu": "China; telecom smart-card and SIM vendor",
+    "Datang": "China; telecom smart-card and SIM vendor",
+}
 
 TELECOM_CARD_MARKERS = (
     "SIM", "UICC", "USIM", "ISIM", "ESIM", "TELECOM", "MOBILE",
@@ -903,6 +924,9 @@ def collect_sim_summary(transport: CardTransport,
         )
         summary["SIM vendor"] = vendor
         summary["Vendor evidence"] = evidence
+        summary["SIM vendor info"] = MAJOR_SIM_VENDOR_INFO.get(
+            vendor, "no embedded major-vendor profile available"
+        )
         if apdu_format is not None:
             pin2_references = (0x81, 0x02) if apdu_format.third_gen else (0x02, 0x81)
             summary["PIN1 status"] = _credential_status(transport, apdu_format, 0x20, (0x01,))
@@ -1296,6 +1320,54 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print("============================================", flush=True)
 
 
+@dataclass(frozen=True)
+class OTAFuzzResult:
+    pid: int
+    dcs: int
+    udhi: bool
+    response: APDUResponse
+    por: ResponsePacket | None = None
+
+
+def analyze_ota_fuzz_results(results: Sequence[OTAFuzzResult]) -> list[str]:
+    """Find parameter-correlated OTA behavior without overstating empty 9000 replies."""
+    if not results:
+        return ["No card responses were received."]
+    lines: list[str] = []
+    signatures = Counter((result.response.sw, result.response.data) for result in results)
+    dominant, dominant_count = signatures.most_common(1)[0]
+    lines.append(f"Dominant response: SW={dominant[0]:04X} DATA={dominant[1].hex().upper() or '<empty>'} "
+                 f"({dominant_count}/{len(results)} variants)")
+    empty_success = sum(1 for result in results
+                        if result.response.sw == 0x9000 and not result.response.data)
+    if empty_success:
+        lines.append(f"{empty_success} variant(s) returned empty 9000: ENVELOPE accepted, but no PoR/data proves OTA execution.")
+    warnings = [result for result in results if result.response.sw1 == 0x62]
+    if warnings:
+        labels = ", ".join(f"PID={r.pid:02X}/DCS={r.dcs:02X}/UDHI={int(r.udhi)}" for r in warnings)
+        lines.append(f"WARNING-sensitive variants ({len(warnings)}): {labels}")
+    for field, label in (("pid", "PID"), ("dcs", "DCS"), ("udhi", "UDHI")):
+        other_fields = [name for name in ("pid", "dcs", "udhi") if name != field]
+        groups: dict[tuple[object, ...], list[OTAFuzzResult]] = {}
+        for result in results:
+            key = tuple(getattr(result, name) for name in other_fields)
+            groups.setdefault(key, []).append(result)
+        differences = 0
+        for group in groups.values():
+            if len({getattr(item, field) for item in group}) > 1 and len({item.response.sw for item in group}) > 1:
+                differences += 1
+        if differences:
+            lines.append(f"{label}-sensitive behavior: {differences} controlled comparison(s) changed SW.")
+    por_results = [result for result in results if result.por is not None]
+    lines.append(f"PoR support: {len(por_results)}/{len(results)} variants returned a parseable response packet.")
+    insecure = [result for result in por_results if result.por.status_code == 0]
+    if insecure:
+        lines.append(f"SECURITY WARNING: {len(insecure)} MSL=0 OTA variant(s) returned successful PoR.")
+    else:
+        lines.append("No successful MSL=0 PoR was observed; transport acceptance alone is not an unprotected-TAR finding.")
+    return lines
+
+
 def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
                      bruteforce: bool = False) -> None:
     """Fuzz SMS PID, DCS, and UDHI around one OTA command packet."""
@@ -1306,6 +1378,7 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
     counts: Counter[int] = Counter()
+    results: list[OTAFuzzResult] = []
     try:
         for index, (pid, dcs, udhi) in enumerate(combinations, 1):
             command = build_sms_pp_download_apdu(
@@ -1324,8 +1397,15 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
                 continue
             counts[response.sw] += 1
             info = decode_status_word(response.sw1, response.sw2)
+            analysis = analyze_apdu_response(command, response)
+            parsed = None
+            try:
+                parsed = ResponsePacket.parse(response.data, strict=False)
+            except PacketError:
+                pass
+            results.append(OTAFuzzResult(pid, dcs, udhi, response, parsed))
             print(f"  RX={response.data.hex().upper() or '<empty>'} SW={response.sw:04X} "
-                  f"- {info.meaning}", flush=True)
+                  f"- {info.meaning}; ANALYSIS={analysis.conclusion}", flush=True)
     finally:
         print_sim_summary(transport, apdu_format)
         try:
@@ -1336,6 +1416,9 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
     print(f"Combinations attempted: {len(combinations)}", flush=True)
     for sw, count in counts.most_common():
         print(f"  SW={sw:04X} COUNT={count} - {decode_status_word(sw >> 8, sw & 255).meaning}", flush=True)
+    print("Smart differential analysis:", flush=True)
+    for line in analyze_ota_fuzz_results(results):
+        print(f"  {line}", flush=True)
     print("=========================================", flush=True)
 
 
@@ -1423,6 +1506,19 @@ def run_self_tests() -> int:
         assert requested_msl(packets[0][1]) == "MSL=0 (no command security)"
         assert "CC" in requested_msl(packets[5][1])
         assert "ciphering" in requested_msl(packets[13][1])
+        matrix = [
+            OTAFuzzResult(0x7F, 0x00, False, APDUResponse(b"", 0x90, 0)),
+            OTAFuzzResult(0x7F, 0x00, True, APDUResponse(b"", 0x90, 0)),
+            OTAFuzzResult(0x7F, 0x04, False, APDUResponse(b"", 0x90, 0)),
+            OTAFuzzResult(0x7F, 0x04, True, APDUResponse(b"", 0x62, 0)),
+            OTAFuzzResult(0x7F, 0xF6, False, APDUResponse(b"", 0x90, 0)),
+            OTAFuzzResult(0x7F, 0xF6, True, APDUResponse(b"", 0x62, 0)),
+        ]
+        intelligence = analyze_ota_fuzz_results(matrix)
+        assert any("UDHI-sensitive" in line for line in intelligence)
+        assert any("DCS-sensitive" in line for line in intelligence)
+        assert any("no PoR/data proves OTA execution" in line for line in intelligence)
+        assert any("not an unprotected-TAR finding" in line for line in intelligence)
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
@@ -1568,6 +1664,7 @@ def run_self_tests() -> int:
         assert lookup_atr_database(bytes.fromhex("3B1094"), database) == ["Gemalto test UICC"]
         db_vendor = detect_sim_vendor(bytes.fromhex("3B1094"), None, atr_database_text=database)
         assert db_vendor[0] == "Gemalto/Thales"
+        assert "Thales" in MAJOR_SIM_VENDOR_INFO["Gemalto/Thales"]
         eftlab = _eftlab_html_to_database(
             "<table><tr><td>3B 10 94</td><td>Thales demo UICC</td></tr></table>"
         )
