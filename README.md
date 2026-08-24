@@ -13,6 +13,7 @@
 > APDU scanning, and OTA fuzzing.
 > Each workflow displays a named SIM-reader selection menu before connecting.
 > Every scan ends with a best-effort ATR, ICCID, IMSI, MSISDN, and SPN summary.
+> The card's classic 2G SIM or modern 3G/UICC APDU format is detected automatically.
 
 SIMTester assess SIM card security in two dimensions:
 

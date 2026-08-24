@@ -394,6 +394,37 @@ class PCSCTransport:
         return bytes(self.connection.getATR())
 
 
+@dataclass(frozen=True)
+class APDUFormat:
+    name: str
+    third_gen: bool
+    select_cla: int
+    envelope_cla: int
+
+
+def detect_apdu_format(transport: CardTransport) -> APDUFormat:
+    """Detect UICC (3G) versus classic SIM (2G) APDU command formatting."""
+    probes = (
+        (APDUFormat("3G/UICC", True, 0x00, 0x80), bytes.fromhex("00A40004023F00")),
+        (APDUFormat("2G SIM", False, 0xA0, 0xA0), bytes.fromhex("A0A40000023F00")),
+    )
+    observations: list[str] = []
+    for apdu_format, command in probes:
+        try:
+            response = transport.transmit(command)
+        except Exception as exc:
+            observations.append(f"{apdu_format.name}: error {exc}")
+            continue
+        observations.append(f"{apdu_format.name}: SW={response.sw:04X}")
+        # 6E00 explicitly rejects CLA. Other status words show that the CLA and
+        # command format reached the card, even if selection itself was denied.
+        if response.sw not in (0x6E00, 0x6D00):
+            print(f"APDU format detected: {apdu_format.name} "
+                  f"(probe {command.hex().upper()} -> SW={response.sw:04X})", flush=True)
+            return apdu_format
+    raise RuntimeError("Unable to detect 2G/3G APDU format; " + "; ".join(observations))
+
+
 def _decode_bcd(data: bytes) -> str:
     digits = "".join(f"{byte & 15:X}{byte >> 4:X}" for byte in data)
     return digits.rstrip("F")
@@ -663,6 +694,8 @@ def _run_scan(reader: int, level2: bool) -> None:
               f"{result} - {info.meaning} [{info.standard}]", flush=True)
 
     transport = PCSCTransport(reader)
+    apdu_format = detect_apdu_format(transport)
+    print(f"Using {apdu_format.name} command format for card setup and follow-ups", flush=True)
     findings: list[ScanFinding] = []
     aborted = False
     try:
@@ -718,6 +751,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     probe_list = list(known_tar_packets(keyset, groups) if probes is None else probes)
     transport = PCSCTransport(reader)
+    apdu_format = detect_apdu_format(transport)
     results: list[tuple[str, str, APDUResponse, ResponsePacket | None]] = []
     errors = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
@@ -725,7 +759,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
     try:
         for index, (group, packet) in enumerate(probe_list, 1):
             tar = packet.tar.hex().upper()
-            command = build_sms_pp_download_apdu(packet)
+            command = build_sms_pp_download_apdu(packet, third_gen=apdu_format.third_gen)
             print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
             response = None
             for attempt in range(3):
@@ -796,10 +830,13 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
     combinations = [(pid, dcs, udhi) for pid in pids for dcs in dcss for udhi in (False, True)]
     packet = CommandPacket(bytes.fromhex(tar), keyset=keyset, user_data=b"\0" * 5)
     transport = PCSCTransport(reader)
+    apdu_format = detect_apdu_format(transport)
     counts: Counter[int] = Counter()
     try:
         for index, (pid, dcs, udhi) in enumerate(combinations, 1):
-            command = build_sms_pp_download_apdu(packet, pid=pid, dcs=dcs, udhi=udhi)
+            command = build_sms_pp_download_apdu(
+                packet, third_gen=apdu_format.third_gen, pid=pid, dcs=dcs, udhi=udhi
+            )
             print(f"[{index:05d}/{len(combinations):05d}] PID={pid:02X} DCS={dcs:02X} "
                   f"UDHI={int(udhi)} TX={command.hex().upper()}", flush=True)
             try:
@@ -902,6 +939,19 @@ def run_self_tests() -> int:
         plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
         assert packets[0][1].to_bytes() in plain
         assert bytes.fromhex("0405002143F50004") in plain
+
+    @check("automatic 2G and 3G APDU format detection")
+    def _apdu_format_detection() -> None:
+        uicc = MockTransport(lambda apdu: APDUResponse(b"", 0x90, 0))
+        assert detect_apdu_format(uicc).name == "3G/UICC"
+
+        def classic_sim(apdu: bytes) -> APDUResponse:
+            return APDUResponse(b"", 0x6E, 0) if apdu[0] == 0 else APDUResponse(b"", 0x9F, 0x16)
+
+        detected = detect_apdu_format(MockTransport(classic_sim))
+        assert detected.name == "2G SIM" and detected.envelope_cla == 0xA0
+        packet = CommandPacket(bytes.fromhex("B00010"), user_data=b"\0" * 5)
+        assert build_sms_pp_download_apdu(packet, third_gen=False)[:2] == bytes.fromhex("A0C2")
 
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
