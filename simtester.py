@@ -12,10 +12,10 @@ import re
 import time
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 class PacketError(ValueError):
@@ -616,6 +616,7 @@ ATR_DATABASE_URL = "https://pcsc-tools.apdu.fr/smartcard_list.txt"
 EFTLAB_ATR_URL = "https://www.eftlab.com/knowledge-base/complete-list-of-atrs"
 _ATR_DATABASE_CACHE: tuple[str | None, str] | None = None
 _EFTLAB_ATR_CACHE: tuple[str | None, str] | None = None
+_COMBINED_ATR_CACHE: tuple[str | None, str] | None = None
 
 
 def load_atr_database() -> tuple[str | None, str]:
@@ -683,6 +684,28 @@ def load_eftlab_atr_database() -> tuple[str | None, str]:
             f"unavailable ({exc}); set SIMTESTER_EFTLAB_ATR_DATABASE to a local HTML copy"
         )
     return _EFTLAB_ATR_CACHE
+
+
+def load_combined_atr_database() -> tuple[str | None, str]:
+    """Return one normalized index assembled from both public ATR sources.
+
+    The normalized text is kept in this single-file process cache. Operators
+    can pin reproducible offline inputs with the two existing environment
+    variables; unavailable sources do not discard entries from the other one.
+    """
+    global _COMBINED_ATR_CACHE
+    if _COMBINED_ATR_CACHE is not None:
+        return _COMBINED_ATR_CACHE
+    pcsc_text, pcsc_source = load_atr_database()
+    eftlab_text, eftlab_source = load_eftlab_atr_database()
+    sections = []
+    if pcsc_text:
+        sections.append(f"# Source: {pcsc_source}\n{pcsc_text}")
+    if eftlab_text:
+        sections.append(f"# Source: {eftlab_source}\n{eftlab_text}")
+    sources = f"pcsc-tools={pcsc_source}; EFTLab={eftlab_source}"
+    _COMBINED_ATR_CACHE = ("\n\n".join(sections) or None, sources)
+    return _COMBINED_ATR_CACHE
 
 
 def lookup_atr_database(atr: bytes, database_text: str | None) -> list[str]:
@@ -900,25 +923,16 @@ def collect_sim_summary(transport: CardTransport,
             summary["Manufacturer area"] = manufacturer.hex().upper()
         gemxpresso = _file_exists(transport, (0x3F00, 0x5F11))
         atr_value = bytes.fromhex(summary["ATR"]) if summary["ATR"] != "unavailable" else b""
-        database_text, database_source = load_atr_database() if use_atr_database else (None, "disabled")
-        eftlab_text, eftlab_source = load_eftlab_atr_database() if use_atr_database else (None, "disabled")
-        summary["pcsc-tools ATR source"] = database_source
-        summary["EFTLab ATR source"] = eftlab_source
-        pcsc_matches = lookup_atr_database(atr_value, database_text)
-        eftlab_matches = lookup_atr_database(atr_value, eftlab_text)
-        pcsc_telecom = filter_major_sim_atr_matches(pcsc_matches)
-        eftlab_telecom = filter_major_sim_atr_matches(eftlab_matches)
-        summary["pcsc-tools major SIM match"] = (
-            " | ".join(f"{vendor}: {description}" for vendor, description in pcsc_telecom[:3]) or "none"
+        combined_database, combined_source = (
+            load_combined_atr_database() if use_atr_database else (None, "disabled")
         )
-        summary["EFTLab major SIM match"] = (
-            " | ".join(f"{vendor}: {description}" for vendor, description in eftlab_telecom[:3]) or "none"
+        summary["Combined ATR sources"] = combined_source
+        database_matches = filter_major_sim_atr_matches(
+            lookup_atr_database(atr_value, combined_database)
         )
-        database_matches = pcsc_telecom + [match for match in eftlab_telecom if match not in pcsc_telecom]
         summary["ATR database match"] = (
             " | ".join(f"{vendor}: {description}" for vendor, description in database_matches[:3]) or "none"
         )
-        combined_database = "\n".join(part for part in (database_text, eftlab_text) if part)
         vendor, evidence = detect_sim_vendor(
             atr_value, manufacturer, gemxpresso, combined_database
         )
@@ -1091,6 +1105,41 @@ def build_tar_packets(ranges: Iterable[tuple[int, int]], *, keyset: int = 0,
         yield CommandPacket(value.to_bytes(3, "big"), keyset=keyset, user_data=user_data)
 
 
+@dataclass(frozen=True)
+class TARContextResult:
+    name: str
+    command: bytes
+    response: APDUResponse
+    analysis: ResponseAnalysis
+
+
+def probe_tar_scan_context(transport: CardTransport,
+                           apdu_format: APDUFormat) -> list[TARContextResult]:
+    """Issue read-only GET STATUS/GET DATA context probes around a TAR scan."""
+    if apdu_format.third_gen:
+        commands = (
+            ("GET STATUS application templates", bytes.fromhex("80F20000024F0000")),
+            ("GET DATA card recognition data", bytes.fromhex("00CA006600")),
+        )
+    else:
+        commands = (
+            ("GET STATUS", bytes.fromhex("A0F2000000")),
+            ("GET DATA card recognition data", bytes.fromhex("A0CA006600")),
+        )
+    results = []
+    for name, command in commands:
+        response = _card_command(transport, command)
+        results.append(TARContextResult(
+            name, command, response, analyze_apdu_response(command, response)
+        ))
+    return results
+
+
+def ensure_por_requested(packet: CommandPacket) -> CommandPacket:
+    """Return a packet whose SPI requests PoR without mutating the caller's packet."""
+    return replace(packet, request_por=True, fake_spi2=None)
+
+
 def _hex(prompt: str, *, length: int | None = None, default: str = "") -> bytes:
     value = input(prompt).strip() or default
     try:
@@ -1221,14 +1270,34 @@ def _run_known_tar_scan(reader: int, keyset: int,
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
-    probe_list = list(known_tar_packets(keyset, groups) if probes is None else probes)
+    supplied_probes = known_tar_packets(keyset, groups) if probes is None else probes
+    # A TAR scan is only conclusive when the UICC can return a response packet.
+    # Force the PoR request bit even for caller-supplied packets that omitted it.
+    probe_list = [
+        (group, ensure_por_requested(packet))
+        for group, packet in supplied_probes
+    ]
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
     results: list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]] = []
+    context_results: list[TARContextResult] = []
     errors = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keyset {keyset}", flush=True)
     try:
+        print("Read-only card context probes:", flush=True)
+        try:
+            for context in probe_tar_scan_context(transport, apdu_format):
+                context_results.append(context)
+                info = decode_status_word(context.response.sw1, context.response.sw2)
+                print(f"  {context.name} TX={context.command.hex().upper()} "
+                      f"RX={context.response.data.hex().upper() or '<empty>'} "
+                      f"SW={context.response.sw:04X} - {info.meaning}; "
+                      f"ANALYSIS={context.analysis.conclusion}; "
+                      f"NEXT={context.analysis.next_step}", flush=True)
+        except Exception as exc:
+            errors += 1
+            print(f"  Context probe error: {exc}; continuing with TAR probes", flush=True)
         for index, (group, packet) in enumerate(probe_list, 1):
             tar = packet.tar.hex().upper()
             command = build_sms_pp_download_apdu(packet, third_gen=apdu_format.third_gen)
@@ -1300,6 +1369,15 @@ def _run_known_tar_scan(reader: int, keyset: int,
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
     print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
+    print("GET STATUS / GET DATA context:", flush=True)
+    for context in context_results:
+        info = decode_status_word(context.response.sw1, context.response.sw2)
+        print(f"  {context.name}: SW={context.response.sw:04X} "
+              f"DATA={context.response.data.hex().upper() or '<empty>'} "
+              f"SEVERITY={context.analysis.severity} - {info.meaning}; "
+              f"{context.analysis.conclusion}", flush=True)
+    if not context_results:
+        print("  unavailable", flush=True)
     print("MSL coverage:", flush=True)
     for level, attempts in msl_attempts.items():
         print(f"  {level}: responses={attempts}, successful-PoR={msl_successes[level]}", flush=True)
@@ -1568,6 +1646,45 @@ def run_self_tests() -> int:
         assert any("PID conclusion" in line for line in intelligence)
         assert any("no PoR/data proves OTA execution" in line for line in intelligence)
         assert any("not an unprotected-TAR finding" in line for line in intelligence)
+
+    @check("combined ATR index, forced PoR and TAR context probes")
+    def _tar_scan_intelligence() -> None:
+        global _ATR_DATABASE_CACHE, _EFTLAB_ATR_CACHE, _COMBINED_ATR_CACHE
+        saved = (_ATR_DATABASE_CACHE, _EFTLAB_ATR_CACHE, _COMBINED_ATR_CACHE)
+        try:
+            _ATR_DATABASE_CACHE = ("3B 10 94\n\tThales UICC", "pcsc fixture")
+            _EFTLAB_ATR_CACHE = ("3B 10 94\n\tGemalto telecom SIM", "EFTLab fixture")
+            _COMBINED_ATR_CACHE = None
+            combined, sources = load_combined_atr_database()
+            assert combined is not None and "Thales UICC" in combined
+            assert "Gemalto telecom SIM" in combined and "pcsc fixture" in sources
+        finally:
+            _ATR_DATABASE_CACHE, _EFTLAB_ATR_CACHE, _COMBINED_ATR_CACHE = saved
+
+        no_por = CommandPacket(bytes.fromhex("B00010"), request_por=False, fake_spi2=0)
+        with_por = ensure_por_requested(no_por)
+        assert not no_por.request_por and with_por.request_por and with_por.fake_spi2 is None
+        commands: list[bytes] = []
+
+        def context_card(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu == bytes.fromhex("80F20000024F0000"):
+                return APDUResponse(b"", 0x61, 0x02)
+            if apdu == bytes.fromhex("80C0000002"):
+                return APDUResponse(b"OK", 0x90, 0x00)
+            return APDUResponse(b"", 0x6A, 0x88)
+
+        context = probe_tar_scan_context(
+            MockTransport(context_card), APDUFormat("3G/UICC", True, 0, 0x80)
+        )
+        assert [item.name for item in context] == [
+            "GET STATUS application templates", "GET DATA card recognition data"
+        ]
+        assert context[0].response == APDUResponse(b"OK", 0x90, 0x00)
+        assert context[1].response.sw == 0x6A88
+        assert commands == [bytes.fromhex(value) for value in (
+            "80F20000024F0000", "80C0000002", "00CA006600"
+        )]
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:

@@ -102,12 +102,16 @@ EFTLab's Complete List of ATRs at
 second source; `SIMTESTER_EFTLAB_ATR_DATABASE` accepts an offline HTML copy.
 APDU findings now include contextual support confidence, severity, conclusions,
 and a recommended next step instead of relying on the status-word label alone.
-Both ATR sources are checked independently. Their raw matches are filtered to
+Both ATR sources are normalized into one index. Their raw matches are filtered to
 telecom indicators (SIM/UICC/USIM/eSIM, GSM/UMTS/LTE/3G/4G/5G, mobile/operator)
 and accepted only when attributed to a recognized major SIM manufacturer;
 payment cards, access badges, and unknown-vendor entries are excluded.
 Major-vendor background is embedded in the script so summaries remain useful
 offline even when both ATR sources are unavailable.
+The pcsc-tools text and normalized EFTLab HTML are now assembled into one
+in-process ATR lookup index, with both source locations retained in
+the summary. Local snapshots can still be selected through the environment
+variables for fully offline and reproducible matching.
 When a probe returns `6881`, the scanner uses MANAGE CHANNEL to open every
 logical channel offered by the UICC (channels 1 through 19), applies ISO/IEC
 7816-4/ETSI channel CLA encoding, retries the APDU on each channel, records the
@@ -121,6 +125,11 @@ For the common 18-variant matrix, it also recognizes the repeated `9000` to
 uses DCS `00` as a control, and reports when PID `00`/`40`/`7F` is independent.
 This is classified as evidence that a different UICC parser path was reached,
 not as evidence that the secured command executed or that a TAR is unprotected.
+Every TAR probe now requests PoR, including caller-supplied packets that omitted
+the request bit. Before delivery, the TAR workflow sends read-only GET STATUS and
+GET DATA context probes in the detected 2G or 3G command form, follows `61xx` and
+`6Cxx`, and includes decoded status, severity, response data, and conclusions in
+both the live log and final summary.
 
 There is nothing to install and no second Python source file. Examples:
 
