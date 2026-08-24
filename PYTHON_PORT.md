@@ -51,6 +51,11 @@ to copy, run, and test without a physical SIM.
   values are explicitly marked application/profile-specific rather than guessed.
 * Completed or aborted scans print totals, communication errors, status-word and
   category counts, and a decoded table of every potentially supported CLA/INS.
+* `61xx` responses automatically trigger an ISO/IEC 7816-4 GET RESPONSE using
+  SW2 as Le; chained response data is collected and shown in the finding.
+* The single script includes the original 135-entry SIMTester probe corpus:
+  RAM, 20 WIB TARs, two S@T TARs, and 112 common RFM/vendor/proprietary applet
+  candidates. Menu option 9 and `known-tars` generate labeled scan packets.
 * Non-interactive subcommands for automation and dependency-free self-tests.
 
 There is nothing to install and no second Python source file. Examples:
@@ -60,6 +65,7 @@ python simtester.py build-ota B00010 --keyset 1 --data A0A40000023F00
 python simtester.py parse-response 027100000B0AB0001000000000010000
 python simtester.py scan-apdu --reader 0
 python simtester.py self-test
+python simtester.py known-tars --groups SAT,WIB --keyset 1
 ```
 
 Run `python simtester.py` without arguments to open the menu. All Python code,

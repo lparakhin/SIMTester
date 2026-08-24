@@ -102,6 +102,27 @@ class CommandPacket:
                    (spi2 & 3) == 1, bool(spi2 & 0x10), bool(spi2 & 0x20))
 
 
+# Curated probe corpus retained from SIMTester. "RFM" contains common remote
+# file-management and vendor/proprietary applet candidates; a TAR is not proof
+# that a specific vendor or application is installed.
+KNOWN_TAR_GROUPS: dict[str, tuple[str, ...]] = {
+    "RAM": tuple("000000".split()),  # Remote Application Management
+    "WIB": tuple("000001 000002 000003 000004 000005 000006 000007 000008 000009 BFFF00\nBFFF01 BFFF02 BFFF03 BFFF04 BFFF05 BFFF15 BFFF22 BFFFBA BFFFEE BFFFFF".split()),  # Wireless Internet Browser
+    "SAT": tuple("505348 534054".split()),  # S@T Browser
+    "RFM": tuple("00000A 00000B 00000C 00000D 00004F 000057 000070 000076 000080 000092\n0000B6 0000E2 000203 000304 000503 010001 010101 010203 012345 012347\n060504 100000 111212 212223 260500 313131 385300 3F0000 3F0001 3F0002\n3F0010 3F0011 41444E 414C4F 415256 415345 424950 425058 434354 443231\n474341 47534D 484353 49434D 494D45 4C5041 4D4552 4D4C4D 4E4147 4E5550\n4E5553 4E5650 4F4350 504F53 514F43 524144 524648 524A49 54454C 524F4D\n533347 534143 534441 534F44 53534D 535353 564153 64646D 800001 800002\n800040 800041 B00000 B00001 B00002 B00003 B0000F B00010 B00011 B00012\nB00013 B00020 B00021 B00030 B00040 B00041 B00042 B00050 B000F1 B00120\nB00140 B00141 B00142 B00143 B00144 B00145 B11000 B20100 B20102 BAFE02\nC00000 C0013D C001AA C001AB C001AD D00003 EED200 EED201 EEE200 EEE201\nFFFF01 FFFFFF".split()),  # RFM/vendor applet candidates
+}
+
+
+def known_tar_packets(keyset: int = 0, groups: Iterable[str] | None = None) -> Iterator[tuple[str, CommandPacket]]:
+    """Yield labeled OTA packets for the curated S@T, WIB, RAM and vendor corpus."""
+    selected = tuple(groups) if groups is not None else tuple(KNOWN_TAR_GROUPS)
+    for group in selected:
+        if group not in KNOWN_TAR_GROUPS:
+            raise ValueError(f"unknown TAR group {group}; choose RAM, WIB, SAT or RFM")
+        for value in KNOWN_TAR_GROUPS[group]:
+            yield group, CommandPacket(bytes.fromhex(value), keyset=keyset, user_data=b"\0" * 5)
+
+
 @dataclass(frozen=True)
 class ResponsePacket:
     tar: bytes | None
@@ -324,31 +345,34 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
     total = 256 * 256 if level2 else 256
     sequence = 0
     consecutive_errors = 0
+
+    def transmit(command: bytes, sequence: int) -> tuple[APDUResponse | None, Exception | None]:
+        last_error = None
+        for attempt in range(retries + 1):
+            if trace is not None:
+                trace(sequence, total, command, None, None)
+            try:
+                return transport.transmit(command), None
+            except Exception as exc:
+                last_error = exc
+                will_retry = attempt < retries
+                if trace is not None:
+                    trace(sequence, total, command, exc, will_retry)
+                if will_retry:
+                    reconnect = getattr(transport, "reconnect", None)
+                    if reconnect is not None:
+                        try:
+                            reconnect()
+                        except Exception:
+                            pass
+                    time.sleep(0.1)
+        return None, last_error
+
     for cla in range(256):
         for instruction in range(256) if level2 else (0,):
             sequence += 1
             command = bytes((cla, instruction, 0, 0))
-            response = None
-            last_error = None
-            for attempt in range(retries + 1):
-                if trace is not None:
-                    trace(sequence, total, command, None, None)
-                try:
-                    response = transport.transmit(command)
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    will_retry = attempt < retries
-                    if trace is not None:
-                        trace(sequence, total, command, exc, will_retry)
-                    if will_retry:
-                        reconnect = getattr(transport, "reconnect", None)
-                        if reconnect is not None:
-                            try:
-                                reconnect()
-                            except Exception:
-                                pass
-                        time.sleep(0.1)
+            response, last_error = transmit(command, sequence)
             if response is None:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
@@ -358,8 +382,27 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                     )
                 continue
             consecutive_errors = 0
+            combined_data = response.data
+            followups = 0
+            response_traced = False
+            while response.sw1 == 0x61 and followups < 8:
+                if trace is not None and followups == 0:
+                    trace(sequence, total, command, response, None)
+                # ISO/IEC 7816-4 GET RESPONSE. SW2=00 encodes the maximum short Le.
+                get_response = bytes((command[0], 0xC0, 0x00, 0x00, response.sw2))
+                followup, last_error = transmit(get_response, sequence)
+                if followup is None:
+                    response = APDUResponse(combined_data, response.sw1, response.sw2)
+                    break
+                combined_data += followup.data
+                response = APDUResponse(combined_data, followup.sw1, followup.sw2)
+                followups += 1
+                if trace is not None:
+                    trace(sequence, total, get_response, followup,
+                          predicate(response) if response.sw1 != 0x61 else None)
+                response_traced = True
             is_interesting = predicate(response)
-            if trace is not None:
+            if trace is not None and not response_traced:
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
                 yield ScanFinding(cla << 8 | instruction, response)
@@ -429,7 +472,7 @@ def _run_scan(reader: int, level2: bool) -> None:
         info = decode_status_word(response.sw1, response.sw2)
         status_counts[response.sw] += 1
         category_counts[info.category] += 1
-        result = "FOUND" if found else "filtered"
+        result = "follow-up" if found is None else ("FOUND" if found else "filtered")
         print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
               f"{result} - {info.meaning} [{info.standard}]", flush=True)
 
@@ -512,9 +555,33 @@ def run_self_tests() -> int:
         assert "3 retries" in decode_status_word(0x63, 0xC3).meaning
         assert "256" in decode_status_word(0x61, 0x00).meaning
 
+    @check("61xx automatically issues GET RESPONSE")
+    def _get_response() -> None:
+        commands: list[bytes] = []
+
+        def handler(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu == bytes.fromhex("00000000"):
+                return APDUResponse(b"", 0x61, 0x03)
+            if apdu == bytes.fromhex("00C0000003"):
+                return APDUResponse(b"XYZ", 0x90, 0x00)
+            return APDUResponse(b"", 0x6E, 0x00)
+
+        findings = list(scan_apdus(MockTransport(handler)))
+        assert commands[:2] == [bytes.fromhex("00000000"), bytes.fromhex("00C0000003")]
+        assert findings[0].response.data == b"XYZ"
+        assert findings[0].response.sw == 0x9000
+
     @check("TAR generation is inclusive and resumable")
     def _tar_generation() -> None:
         assert list(tar_values([(1, 3), (10, 11)], start=2)) == [2, 3, 10, 11]
+
+    @check("known S@T, WIB and vendor TAR corpus")
+    def _known_tars() -> None:
+        assert len(KNOWN_TAR_GROUPS["SAT"]) == 2
+        assert len(KNOWN_TAR_GROUPS["WIB"]) == 20
+        assert sum(map(len, KNOWN_TAR_GROUPS.values())) == 135
+        assert next(known_tar_packets(groups=("SAT",)))[1].tar == bytes.fromhex("505348")
 
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
@@ -566,6 +633,7 @@ def interactive_menu() -> int:
         "3": "Parse OTA response packet", "4": "Preview TAR scan packets",
         "5": "List PC/SC readers", "6": "Run APDU level 1 scan",
         "7": "Run APDU level 2 scan", "8": "Run built-in self-tests",
+        "9": "Preview known S@T/WIB/vendor TAR probes",
         "0": "Exit",
     }
     while True:
@@ -599,8 +667,14 @@ def interactive_menu() -> int:
                 _run_scan(_read_int("Reader index [0]: "), choice == "7")
             elif choice == "8":
                 run_self_tests()
+            elif choice == "9":
+                groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
+                selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                keyset = _read_int("Keyset [0]: ")
+                for group, packet in known_tar_packets(keyset, selected):
+                    print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
             else:
-                print("Unknown option. Choose 0 through 8.")
+                print("Unknown option. Choose 0 through 9.")
         except (PacketError, RuntimeError, ValueError) as exc:
             print(f"Error: {exc}")
         except (EOFError, KeyboardInterrupt):
@@ -618,6 +692,9 @@ def make_parser() -> argparse.ArgumentParser:
     parse.add_argument("hex"); parse.add_argument("--lenient", action="store_true")
     scan = commands.add_parser("scan-apdu")
     scan.add_argument("--reader", type=int, default=0); scan.add_argument("--level2", action="store_true")
+    known = commands.add_parser("known-tars")
+    known.add_argument("--keyset", type=int, default=0)
+    known.add_argument("--groups", default="ALL", help="comma-separated RAM,WIB,SAT,RFM")
     commands.add_parser("menu")
     commands.add_parser("self-test")
     return parser
@@ -636,6 +713,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_response(ResponsePacket.parse(bytes.fromhex(args.hex), strict=not args.lenient))
     elif args.command == "scan-apdu":
         _run_scan(args.reader, args.level2)
+    elif args.command == "known-tars":
+        selected = None if args.groups.upper() == "ALL" else tuple(
+            group.strip().upper() for group in args.groups.split(",")
+        )
+        for group, packet in known_tar_packets(args.keyset, selected):
+            print(f"{group}:{packet.tar.hex().upper()} {packet.to_bytes().hex().upper()}")
     return 0
 
 
