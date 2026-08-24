@@ -133,11 +133,14 @@ def _tlv(tag: int, value: bytes) -> bytes:
     return bytes((tag,)) + length + value
 
 
-def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True) -> bytes:
+def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True,
+                               pid: int = 0x7F, dcs: int = 0xF6,
+                               udhi: bool = True) -> bytes:
     """Wrap an OTA packet in an SMS-PP DOWNLOAD ENVELOPE APDU."""
     command_packet = packet.to_bytes()
     # SMS-DELIVER: UDHI, fixed test originator, SIM data-download PID/DCS.
-    tpdu = (b"\x44\x05\x00\x21\x43\xF5\x7F\xF6" + b"\0" * 7
+    first_octet = 0x04 | (0x40 if udhi else 0)
+    tpdu = (bytes((first_octet,)) + b"\x05\x00\x21\x43\xF5" + bytes((pid, dcs)) + b"\0" * 7
             + bytes((len(command_packet),)) + command_packet)
     device_identities = bytes((0x82 if third_gen else 0x02, 0x02, 0x83, 0x81))
     address = bytes.fromhex("86050021436587" if third_gen else "06050021436587")
@@ -146,6 +149,32 @@ def build_sms_pp_download_apdu(packet: CommandPacket, *, third_gen: bool = True)
     if len(envelope) > 255:
         raise PacketError("SMS-PP envelope exceeds short APDU length")
     return bytes((0x80 if third_gen else 0xA0, 0xC2, 0x00, 0x00, len(envelope))) + envelope
+
+
+FUZZER_PROFILES = (
+    (0, 0, 0, False, False), (0, 0, 0, True, False),
+    (1, 0, 0, True, False), (2, 0, 0, True, False),
+    (3, 0, 0, True, False), (3, 0, 1, True, False),
+    (3, 0, 2, True, False), (3, 0, 3, True, False),
+    (3, 3, 3, True, False), (0, 0, 0, True, True),
+    (1, 0, 0, True, True), (2, 0, 0, True, True),
+    (3, 0, 0, True, True), (3, 1, 0, True, True),
+    (3, 2, 0, True, True), (3, 3, 0, True, True),
+    (3, 3, 3, True, True),
+)
+
+
+def standard_fuzzer_packets(tars: Iterable[str], keysets: Iterable[int]) -> Iterator[tuple[str, CommandPacket]]:
+    """Generate the original 17 standard fuzzing mechanisms."""
+    for tar in tars:
+        tar_bytes = bytes.fromhex(tar)
+        for keyset in keysets:
+            for index, (counter, kic, kid, por, cipher_por) in enumerate(FUZZER_PROFILES):
+                yield f"F{index:02d}/K{keyset}", CommandPacket(
+                    tar_bytes, keyset, user_data=b"\0" * 5,
+                    counter_management=counter, kic_algorithm=kic,
+                    kid_algorithm=kid, request_por=por, cipher_por=cipher_por,
+                )
 
 
 @dataclass(frozen=True)
@@ -547,22 +576,24 @@ def _run_scan(reader: int, level2: bool) -> None:
 
 
 def _run_known_tar_scan(reader: int, keyset: int,
-                        groups: Iterable[str] | None = None) -> None:
+                        groups: Iterable[str] | None = None,
+                        probes: Iterable[tuple[str, CommandPacket]] | None = None,
+                        title: str = "KNOWN TAR SCAN") -> None:
     """Deliver the known TAR corpus over SMS-PP and summarize card responses."""
     reader_names = PCSCTransport.readers()
     if not 0 <= reader < len(reader_names):
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
-    probes = list(known_tar_packets(keyset, groups))
+    probe_list = list(known_tar_packets(keyset, groups) if probes is None else probes)
     transport = PCSCTransport(reader)
     results: list[tuple[str, str, APDUResponse, ResponsePacket | None]] = []
     errors = 0
-    print(f"KNOWN TAR SCAN START: {len(probes)} probes; reader {reader}: "
+    print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
           f"{reader_names[reader]}; keyset {keyset}", flush=True)
     try:
-        for index, (group, packet) in enumerate(probes, 1):
+        for index, (group, packet) in enumerate(probe_list, 1):
             tar = packet.tar.hex().upper()
             command = build_sms_pp_download_apdu(packet)
-            print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
+            print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} TX APDU={command.hex().upper()}", flush=True)
             response = None
             for attempt in range(3):
                 try:
@@ -570,7 +601,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
                     break
                 except Exception as exc:
                     errors += 1
-                    print(f"[{index:03d}/{len(probes):03d}] ERROR {exc} - "
+                    print(f"[{index:03d}/{len(probe_list):03d}] ERROR {exc} - "
                           f"{'retrying' if attempt < 2 else 'SKIPPED'}", flush=True)
                     if attempt < 2:
                         try:
@@ -583,13 +614,13 @@ def _run_known_tar_scan(reader: int, keyset: int,
             data = response.data
             while response.sw1 == 0x61:
                 followup_apdu = bytes((command[0], 0xC0, 0, 0, response.sw2))
-                print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} "
+                print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} "
                       f"TX GET RESPONSE={followup_apdu.hex().upper()}", flush=True)
                 try:
                     response = transport.transmit(followup_apdu)
                 except Exception as exc:
                     errors += 1
-                    print(f"[{index:03d}/{len(probes):03d}] GET RESPONSE ERROR: {exc}", flush=True)
+                    print(f"[{index:03d}/{len(probe_list):03d}] GET RESPONSE ERROR: {exc}", flush=True)
                     break
                 data += response.data
             response = APDUResponse(data, response.sw1, response.sw2)
@@ -600,7 +631,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
             except PacketError:
                 pass
             ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
-            print(f"[{index:03d}/{len(probes):03d}] {group}:{tar} RX "
+            print(f"[{index:03d}/{len(probe_list):03d}] {group}:{tar} RX "
                   f"DATA={data.hex().upper() or '<empty>'} SW={response.sw:04X}{ota} "
                   f"- {info.meaning}", flush=True)
             results.append((group, tar, response, parsed))
@@ -610,8 +641,8 @@ def _run_known_tar_scan(reader: int, keyset: int,
         except Exception:
             pass
     parsed_results = [result for result in results if result[3] is not None]
-    print("\n========== KNOWN TAR SCAN SUMMARY ==========", flush=True)
-    print(f"Probes attempted: {len(probes)}", flush=True)
+    print(f"\n========== {title} SUMMARY ==========", flush=True)
+    print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
@@ -621,6 +652,45 @@ def _run_known_tar_scan(reader: int, keyset: int,
         print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
               f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
     print("============================================", flush=True)
+
+
+def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
+                     bruteforce: bool = False) -> None:
+    """Fuzz SMS PID, DCS, and UDHI around one OTA command packet."""
+    pids = range(256) if bruteforce else (0x00, 0x40, 0x7F)
+    dcss = range(256) if bruteforce else (0x00, 0x04, 0xF6)
+    combinations = [(pid, dcs, udhi) for pid in pids for dcs in dcss for udhi in (False, True)]
+    packet = CommandPacket(bytes.fromhex(tar), keyset=keyset, user_data=b"\0" * 5)
+    transport = PCSCTransport(reader)
+    counts: Counter[int] = Counter()
+    try:
+        for index, (pid, dcs, udhi) in enumerate(combinations, 1):
+            command = build_sms_pp_download_apdu(packet, pid=pid, dcs=dcs, udhi=udhi)
+            print(f"[{index:05d}/{len(combinations):05d}] PID={pid:02X} DCS={dcs:02X} "
+                  f"UDHI={int(udhi)} TX={command.hex().upper()}", flush=True)
+            try:
+                response = transport.transmit(command)
+            except Exception as exc:
+                print(f"  ERROR: {exc}", flush=True)
+                try:
+                    transport.reconnect()
+                except Exception:
+                    pass
+                continue
+            counts[response.sw] += 1
+            info = decode_status_word(response.sw1, response.sw2)
+            print(f"  RX={response.data.hex().upper() or '<empty>'} SW={response.sw:04X} "
+                  f"- {info.meaning}", flush=True)
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+    print("\n========== OTA FUZZING SUMMARY ==========", flush=True)
+    print(f"Combinations attempted: {len(combinations)}", flush=True)
+    for sw, count in counts.most_common():
+        print(f"  SW={sw:04X} COUNT={count} - {decode_status_word(sw >> 8, sw & 255).meaning}", flush=True)
+    print("=========================================", flush=True)
 
 
 def run_self_tests() -> int:
@@ -689,6 +759,15 @@ def run_self_tests() -> int:
         assert envelope[:5] == bytes((0x80, 0xC2, 0, 0, len(envelope) - 5))
         assert packet.to_bytes() in envelope
 
+    @check("standard fuzzer matrix and OTA envelope variants")
+    def _fuzzing_modes() -> None:
+        packets = list(standard_fuzzer_packets(("B00010",), (1,)))
+        assert len(packets) == 17
+        assert packets[0][0] == "F00/K1" and packets[-1][0] == "F16/K1"
+        plain = build_sms_pp_download_apdu(packets[0][1], pid=0, dcs=4, udhi=False)
+        assert packets[0][1].to_bytes() in plain
+        assert bytes.fromhex("0405002143F50004") in plain
+
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
         trace_log: list[tuple[int, int, bytes, APDUTraceValue, bool | None]] = []
@@ -735,11 +814,8 @@ def run_self_tests() -> int:
 def interactive_menu() -> int:
     """Run all available tools from one interactive menu."""
     actions = {
-        "1": "Build OTA command packet", "2": "Parse OTA command packet",
-        "3": "Parse OTA response packet", "4": "Preview TAR scan packets",
-        "5": "List PC/SC readers", "6": "Run APDU level 1 scan",
-        "7": "Run APDU level 2 scan", "8": "Run built-in self-tests",
-        "9": "Scan known S@T/WIB/vendor TARs over SMS-PP",
+        "1": "Standard fuzzing", "2": "TAR scanning",
+        "3": "APDU scanning", "4": "OTA fuzzing",
         "0": "Exit",
     }
     while True:
@@ -751,36 +827,37 @@ def interactive_menu() -> int:
             if choice == "0":
                 return 0
             if choice == "1":
-                packet = CommandPacket(_hex("TAR [B00010]: ", length=3, default="B00010"),
-                                       _read_int("Keyset [0]: "), _read_int("Counter [0]: "),
-                                       _hex("User data hex [empty]: "))
-                print(packet.to_bytes().hex().upper())
+                tars = input("TARs comma-separated [000000,B00001,B00010]: ").strip()
+                tar_list = [value.strip().upper() for value in (tars or "000000,B00001,B00010").split(",")]
+                keysets = input("Keysets comma-separated [1,2,3,4,5,6]: ").strip()
+                keyset_list = [int(value) for value in (keysets or "1,2,3,4,5,6").split(",")]
+                reader = _read_int("Reader index [0]: ")
+                _run_known_tar_scan(reader, 0, probes=standard_fuzzer_packets(tar_list, keyset_list),
+                                    title="STANDARD FUZZING")
             elif choice == "2":
-                packet = CommandPacket.parse(_hex("Command packet hex: "))
-                print(packet)
-            elif choice == "3":
-                _print_response(ResponsePacket.parse(_hex("Response packet hex: "), strict=False))
-            elif choice == "4":
-                low = _read_int("First TAR hex [000000]: ", base=16)
-                high = _read_int("Last TAR hex [00000F]: ", 15, 16)
-                keyset = _read_int("Keyset [0]: ")
-                for packet in build_tar_packets([(low, high)], keyset=keyset):
-                    print(f"{packet.tar.hex().upper()}: {packet.to_bytes().hex().upper()}")
-            elif choice == "5":
-                readers = PCSCTransport.readers()
-                print("\n".join(f"{index}: {reader}" for index, reader in enumerate(readers)) or "No readers found")
-            elif choice in {"6", "7"}:
-                _run_scan(_read_int("Reader index [0]: "), choice == "7")
-            elif choice == "8":
-                run_self_tests()
-            elif choice == "9":
-                groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
-                selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                mode = input("Known corpus or hexadecimal range? [known/range]: ").strip().lower() or "known"
                 keyset = _read_int("Keyset [0]: ")
                 reader = _read_int("Reader index [0]: ")
-                _run_known_tar_scan(reader, keyset, selected)
+                if mode == "range":
+                    low = _read_int("First TAR hex [000000]: ", base=16)
+                    high = _read_int("Last TAR hex [0000FF]: ", 0xFF, 16)
+                    probes = (("RANGE", packet) for packet in build_tar_packets([(low, high)], keyset=keyset))
+                    _run_known_tar_scan(reader, keyset, probes=probes, title="TAR RANGE SCAN")
+                else:
+                    groups = input("Groups [RAM,WIB,SAT,RFM or ALL]: ").strip().upper() or "ALL"
+                    selected = None if groups == "ALL" else tuple(part.strip() for part in groups.split(","))
+                    _run_known_tar_scan(reader, keyset, selected)
+            elif choice == "3":
+                level = _read_int("APDU scan level [1]: ", 1)
+                _run_scan(_read_int("Reader index [0]: "), level == 2)
+            elif choice == "4":
+                tar = input("TAR [B00010]: ").strip().upper() or "B00010"
+                keyset = _read_int("Keyset [0]: ")
+                reader = _read_int("Reader index [0]: ")
+                bruteforce = input("Bruteforce all PID/DCS values? [y/N]: ").strip().lower() == "y"
+                _run_ota_fuzzing(reader, tar, keyset, bruteforce)
             else:
-                print("Unknown option. Choose 0 through 9.")
+                print("Unknown option. Choose 0 through 4.")
         except (PacketError, RuntimeError, ValueError) as exc:
             print(f"Error: {exc}")
         except (EOFError, KeyboardInterrupt):

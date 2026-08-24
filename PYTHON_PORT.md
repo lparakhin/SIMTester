@@ -55,9 +55,20 @@ to copy, run, and test without a physical SIM.
   SW2 as Le; chained response data is collected and shown in the finding.
 * The single script includes the original 135-entry SIMTester probe corpus:
   RAM, 20 WIB TARs, two S@T TARs, and 112 common RFM/vendor/proprietary applet
-  candidates. Menu option 9 and `scan-known-tars` deliver them to the selected
+  candidates. TAR scanning in menu option 2 and `scan-known-tars` deliver them to the selected
   UICC as SMS-PP DOWNLOAD envelopes; `known-tars` only previews packet bytes.
 * Non-interactive subcommands for automation and dependency-free self-tests.
+
+## Simplified interactive menu
+
+Running `python simtester.py` now shows only the four primary test workflows:
+
+1. Standard fuzzing with the original 17 mechanisms and configurable TAR/keysets.
+2. TAR scanning using either the known corpus or a hexadecimal range.
+3. APDU scanning at level 1 or level 2.
+4. OTA fuzzing of PID, DCS, and UDHI values (common values or brute force).
+
+Lower-level packet and automation commands remain available as CLI subcommands.
 
 There is nothing to install and no second Python source file. Examples:
 
