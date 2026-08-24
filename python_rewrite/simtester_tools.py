@@ -1,0 +1,741 @@
+"""Single-file Python SIMTester tools with menu-driven multi-SIM reader support."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+import os
+import re
+import threading
+import time
+
+
+def to_hex(data: bytes | bytearray | None) -> str:
+    return bytes(data).hex().upper() if data else ""
+
+
+def _safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "reader"
+
+
+def decode_atr(atr: bytes) -> str:
+    if not atr:
+        return "ATR unavailable"
+    ts = atr[0]
+    ts_desc = "direct convention" if ts == 0x3B else ("inverse convention" if ts == 0x3F else "unknown convention")
+    t0 = atr[1] if len(atr) > 1 else 0
+    k = t0 & 0x0F
+    y = (t0 & 0xF0) >> 4
+    return f"ATR={to_hex(atr)}; {ts_desc}; historical_bytes={k}; interface_bytes_mask=0x{y:X}"
+
+
+def log_reader_atr(reader: "ReaderBackend") -> None:
+    atr = reader.get_atr()
+    print(f"[{reader.name}] {decode_atr(atr)}")
+
+
+def decode_sw(sw1: int, sw2: int) -> str:
+    sw = (sw1 << 8) | sw2
+    exact = {
+        0x9000: "Normal ending of command",
+        0x9804: "Access condition not fulfilled / security status not satisfied (SIM/USIM)",
+        0x9840: "PIN verification required (SIM/USIM)",
+        0x9844: "Referenced data not found",
+        0x9850: "INCREASE cannot be performed",
+        0x6982: "Security status not satisfied",
+        0x6985: "Conditions of use not satisfied",
+        0x6A82: "File/application not found",
+        0x6A86: "Incorrect P1/P2",
+        0x6D00: "Instruction code not supported",
+        0x6E00: "Class not supported",
+        0x6F00: "Technical problem; no precise diagnosis available",
+        0x6A84: "Not enough memory space",
+        0x6700: "Wrong length",
+        0x6881: "Logical channel not supported",
+        0x6882: "Secure messaging not supported",
+        0x9300: "SIM Toolkit busy",
+    }
+    if sw in exact:
+        return exact[sw]
+    if sw1 == 0x61:
+        return f"More response bytes available: {sw2} (GET RESPONSE required)"
+    if sw1 == 0x62:
+        return "Warning state of non-volatile memory unchanged"
+    if sw1 == 0x63:
+        return "Warning state of non-volatile memory changed"
+    if sw1 == 0x67:
+        return "Wrong length"
+    if sw1 == 0x6C:
+        return f"Wrong Le, correct value is {sw2}"
+    if sw1 == 0x91:
+        return f"Proactive command pending, FETCH length {sw2}"
+    if sw1 == 0x9E or sw1 == 0x9F:
+        return f"SIM application response available: {sw2} bytes"
+    return f"Unknown status word {sw1:02X}{sw2:02X}"
+
+
+def _parse_tlvs(data: bytes) -> list[tuple[int, bytes]]:
+    out = []
+    i = 0
+    while i + 1 < len(data):
+        tag = data[i]
+        i += 1
+        ln = data[i]
+        i += 1
+        if ln & 0x80:
+            n = ln & 0x7F
+            if i + n > len(data):
+                break
+            ln = int.from_bytes(data[i : i + n], "big")
+            i += n
+        if i + ln > len(data):
+            break
+        out.append((tag, data[i : i + ln]))
+        i += ln
+    return out
+
+
+
+
+def tar_detected(resp: bytes) -> bool:
+    if len(resp) < 2:
+        return False
+    sw1, sw2 = resp[-2], resp[-1]
+    # treat success/warning/continuation as potentially detected TAR endpoints
+    if sw1 in {0x90, 0x91, 0x9E, 0x9F, 0x61, 0x62, 0x63}:
+        return True
+    # known negative statuses -> not detected
+    if (sw1, sw2) in {(0x6A, 0x82), (0x6A, 0x86), (0x6D, 0x00), (0x6E, 0x00), (0x69, 0x82), (0x69, 0x85), (0x98, 0x04)}:
+        return False
+    return False
+
+
+
+def _tlv_name(tag: int, context: str = "apdu") -> str:
+    base = {
+        0x62: "FCP template",
+        0x6F: "FCI template",
+        0xA5: "FCI proprietary template",
+        0x7C: "Response message template",
+        0x80: "File size",
+        0x81: "Total file size",
+        0x82: "File descriptor",
+        0x83: "File identifier",
+        0x84: "AID/DF name",
+        0x88: "Short File Identifier",
+        0x8A: "Life cycle status",
+        0x8B: "Security attributes",
+        0x8C: "Security attributes (expanded)",
+        0x90: "PIN status template",
+        0xC6: "PIN status bytes",
+        0xD0: "Proactive SIM command",
+        0xD1: "SMS-PP download",
+        0xD3: "Cell broadcast download",
+    }
+    if context == "tar" and tag == 0x83:
+        return "TAR response parameter"
+    return base.get(tag, f"Tag {tag:02X}")
+
+
+def _parse_tlv_tree(data: bytes) -> list[tuple[int, bytes]]:
+    return _parse_tlvs(data)
+
+
+def _decode_file_descriptor(v: bytes) -> str:
+    if not v:
+        return ""
+    b0 = v[0]
+    file_type = "DF" if (b0 & 0x38) == 0x38 else "EF"
+    structure = {
+        0x01: "transparent",
+        0x02: "linear fixed",
+        0x06: "cyclic",
+    }.get(b0 & 0x07, "unknown")
+    return f"{file_type}, structure={structure}"
+
+
+def decode_3gpp_tlvs(data: bytes, depth: int = 0, context: str = "apdu") -> str:
+    if not data:
+        return ""
+    tlvs = _parse_tlv_tree(data)
+    if not tlvs:
+        # heuristic fallback: find embedded template start and retry
+        for marker in (0x62, 0x6F, 0xA5, 0x7C):
+            try:
+                idx = data.index(bytes([marker]))
+            except ValueError:
+                continue
+            if idx > 0:
+                tlvs = _parse_tlv_tree(data[idx:])
+                if tlvs:
+                    break
+    if not tlvs:
+        return ""
+    parts: list[str] = []
+    for tag, value in tlvs:
+        name = _tlv_name(tag, context=context)
+        extra = ""
+        if tag == 0x82:
+            extra = _decode_file_descriptor(value)
+        elif tag == 0x8A and value:
+            extra = {
+                0x01: "creation state",
+                0x05: "operational (activated)",
+                0x0C: "termination",
+            }.get(value[0], "unknown")
+        line = f"{name}={to_hex(value)}"
+        if extra:
+            line += f" ({extra})"
+        parts.append(line)
+
+        if tag in {0x62, 0x6F, 0xA5, 0x7C}:
+            nested = decode_3gpp_tlvs(value, depth + 1, context=context)
+            if nested:
+                parts.append(nested)
+    return "; ".join(parts)
+
+
+def analyze_response(sw1: int, sw2: int, body: bytes, context: str = "apdu") -> str:
+    notes = [decode_sw(sw1, sw2)]
+    if sw1 in {0x61, 0x9F}:
+        notes.append("Follow-up GET RESPONSE recommended")
+    if sw1 == 0x91:
+        notes.append("Proactive command pending (FETCH path)")
+    if body and body[0] in {0x62, 0x6F, 0xA5, 0x7C, 0xD0, 0xD1, 0xD3}:
+        tlv_decoded = decode_3gpp_tlvs(body, context=context)
+        if tlv_decoded:
+            notes.append("3GPP/ETSI decode: " + tlv_decoded)
+    return " | ".join(notes)
+
+def decode_apdu_response(resp: bytes, context: str = "apdu") -> str:
+    if len(resp) < 2:
+        return "Malformed APDU response"
+    sw1, sw2 = resp[-2], resp[-1]
+    body = resp[:-2]
+    return analyze_response(sw1, sw2, body, context=context)
+
+
+@dataclass(frozen=True)
+class FuzzerData:
+    name: str
+    counter: int
+    kic: int
+    kid: int
+    request_por: bool
+    cipher_por: bool
+
+
+FUZZERS = {
+    0: FuzzerData("fuzzer0", 0x0, 0, 0, False, False),
+    1: FuzzerData("fuzzer1", 0x0, 0, 0, True, False),
+    9: FuzzerData("fuzzer9", 0x0, 0, 0, True, True),
+}
+DEFAULT_TARS = ["RAM:000000", "WIB:000001", "WIB:000002", "RFM:00000A", "SAT:505348", "RFM:FFFFFF"]
+
+# Curated cross-vendor / ecosystem list (publicly observed/default TAR families)
+WELL_KNOWN_TARS = {
+    "Gemalto/Thales": ["RFM:B00001", "RFM:B00145", "RFM:FFFFFF"],
+    "Giesecke+Devrient": ["RFM:B00010", "RFM:B00040", "RFM:B00050"],
+    "IDEMIA/OT": ["RFM:B00120", "RFM:B00140", "RFM:B00141"],
+    "STK/WIB/S@T": ["WIB:000001", "WIB:BFFF00", "SAT:505348", "SAT:534054"],
+    "Generic OTA/RFM": ["RAM:000000", "RFM:00000A", "RFM:3F0000", "RFM:800001"],
+}
+
+
+
+def classify_tar(tar_hex: str) -> str:
+    upper = tar_hex.upper()
+    if upper.startswith("0000") or upper.startswith("BFFF"):
+        return "WIB family detected"
+    if upper in {"505348", "534054"}:
+        return "S@T family detected"
+    if upper.startswith("B0") or upper.startswith("B1"):
+        return "RFM / OTA management family detected"
+    if upper == "000000":
+        return "RAM/Generic OTA TAR detected"
+    return "Unknown/other TAR family"
+
+
+def tar_human_name(tar_hex: str) -> str:
+    upper = tar_hex.upper()
+    for vendor, tars in WELL_KNOWN_TARS.items():
+        for t in tars:
+            if t.split(":")[1] == upper:
+                return f"{vendor} profile"
+    return classify_tar(upper)
+
+def get_well_known_tars() -> list[str]:
+    merged: list[str] = []
+    for values in WELL_KNOWN_TARS.values():
+        merged.extend(values)
+    # stable unique
+    seen = set()
+    out = []
+    for t in merged:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+class CSVWriter:
+    def __init__(self, iccid: str, scan_type: str, reader_name: str, logging: bool = True):
+        self._lock = threading.Lock()
+        self._logging = logging
+        self._header_written = False
+        self._path: Path | None = None
+        self._fp = None
+        if logging:
+            safe_reader = _safe_filename(reader_name)
+            self._path = Path(f".{scan_type}_{safe_reader}_{iccid}_{int(time.time()*1000)}.csv")
+            self._fp = self._path.open("w", encoding="utf-8")
+
+    def write_raw_line(self, line: str) -> None:
+        if self._logging:
+            with self._lock:
+                self._fp.write(line + "\n")
+                self._fp.flush()
+
+    def write_line(self, identifier: str, cmd: bytes, resp: bytes, decoded: str = "") -> None:
+        if not self._logging:
+            return
+        with self._lock:
+            if not self._header_written:
+                self._fp.write("# id,Command data,Response data,Decoded\n")
+                self._header_written = True
+            self._fp.write(f"{identifier},{to_hex(cmd)},{to_hex(resp)},{decoded.replace(',', ';')}\n")
+            self._fp.flush()
+
+    def unhide(self) -> str:
+        if not self._path:
+            return ""
+        if self._path.name.startswith("."):
+            target = self._path.with_name(self._path.name[1:])
+            self._fp.close()
+            self._path.rename(target)
+            self._path = target
+        return self._path.name
+
+
+@dataclass
+class SimCardFileView:
+    file_id: str
+    file_type: str
+    child_dfs: int = 0
+    child_efs: int = 0
+
+
+def _ber_length(length: int) -> bytes:
+    if not 0 <= length <= 0xFFFF:
+        raise ValueError("BER-TLV payload is too large")
+    if length < 0x80:
+        return bytes((length,))
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes((0x80 | len(encoded),)) + encoded
+
+
+def build_command_packet(
+    tar: bytes,
+    keyset: int,
+    user_data: bytes = bytes.fromhex("A0A40000023F00"),
+    counter: int = 1,
+    request_por: bool = True,
+    por_cc: bool = True,
+) -> bytes:
+    """Build an unencrypted 3GPP TS 23.048 command packet."""
+    if len(tar) != 3:
+        raise ValueError("TAR must be exactly three bytes")
+    if not 0 <= keyset <= 0x0F:
+        raise ValueError("keyset must be between 0 and 15")
+    if not 0 <= counter < (1 << 40):
+        raise ValueError("counter must fit in five bytes")
+
+    spi1 = 0x00  # no command ciphering/checksum; no counter available
+    spi2 = (0x01 if request_por else 0x00) | (0x08 if request_por and por_cc else 0x00)
+    spi2 |= 0x20  # PoR via SMS-SUBMIT, matching the original TAR scanner
+    command_header = bytes((spi1, spi2, keyset << 4, keyset << 4))
+    command_header += tar + counter.to_bytes(5, "big") + b"\x00"
+    chl = len(command_header)
+    secured_data = bytes((chl,)) + command_header + user_data
+    return b"\x02\x70\x00" + len(secured_data).to_bytes(2, "big") + secured_data
+
+
+def build_sms_pp_download_apdu(command_packet: bytes, pid: int = 0x7F, dcs: int = 0xF6) -> bytes:
+    """Wrap a command packet in a UICC SMS-PP DOWNLOAD ENVELOPE APDU."""
+    if not 0 <= pid <= 0xFF or not 0 <= dcs <= 0xFF:
+        raise ValueError("PID and DCS must be single-byte values")
+    if len(command_packet) > 0xFF:
+        raise ValueError("command packet does not fit in an SMS TP-UD")
+
+    # SMS-DELIVER: UDHI set, fixed test originator, zero SCTS, binary TP-UD.
+    tpdu = b"\x44\x05\x00\x21\x43\xF5" + bytes((pid, dcs)) + (b"\x00" * 7)
+    tpdu += bytes((len(command_packet),)) + command_packet
+    envelope = b"\x82\x02\x83\x81"  # network -> UICC device identities
+    envelope += b"\x86\x05\x00\x21\x43\x65\x87"  # address
+    envelope += b"\x8B" + _ber_length(len(tpdu)) + tpdu
+    data = b"\xD1" + _ber_length(len(envelope)) + envelope
+    if len(data) > 0xFF:
+        raise ValueError("ENVELOPE data requires unsupported extended-length APDU")
+    return b"\x80\xC2\x00\x00" + bytes((len(data),)) + data
+
+
+class ReaderBackend:
+    def __init__(self, name: str, allow_dummy: bool = False):
+        self.name = name
+        self.allow_dummy = allow_dummy
+        self._conn = None
+        self._init_real_reader()
+
+    def _init_real_reader(self) -> None:
+        last_error = None
+        try:
+            from smartcard.System import readers as pcsc_readers
+
+            matched = [r for r in pcsc_readers() if str(r) == self.name]
+            if not matched:
+                last_error = RuntimeError("Reader not found in current PC/SC list")
+            else:
+                for r in matched:
+                    try:
+                        conn = r.createConnection()
+                        conn.connect()
+                        self._conn = conn
+                        print(f"[{self.name}] connected to real SIM reader")
+                        return
+                    except Exception as exc:
+                        last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if self.allow_dummy:
+            print(f"[{self.name}] WARNING: real reader unavailable ({last_error}); using dummy transport")
+            return
+
+        raise RuntimeError(
+            f"Unable to initialize real reader '{self.name}'. "
+            f"Reason: {last_error}. Insert card or rerun with --allow-dummy to continue."
+        )
+
+    def get_atr(self) -> bytes:
+        if self._conn:
+            try:
+                return bytes(self._conn.getATR())
+            except Exception:
+                return b""
+        return b""
+
+    def _log_exchange(self, apdu: bytes, resp: bytes, context: str = "apdu") -> None:
+        decoded = " || ".join(decode_apdu_response(part, context=context) for part in resp.split(b"|"))
+        print(f"[{self.name}] APDU {to_hex(apdu)} -> {to_hex(resp)} | {decoded}")
+
+    def transmit(self, apdu: bytes) -> bytes:
+        if self._conn:
+            data, sw1, sw2 = self._conn.transmit(list(apdu))
+            resp = bytes(data + [sw1, sw2])
+            self._log_exchange(apdu, resp, context="apdu")
+            return resp
+        if self.allow_dummy:
+            resp = apdu[:2] + b"\x90\x00"
+            self._log_exchange(apdu, resp, context="apdu")
+            return resp
+        raise RuntimeError(f"No real reader connection for {self.name}")
+
+
+    def maybe_get_response(self, original_apdu: bytes, resp: bytes) -> bytes:
+        if len(resp) < 2:
+            return resp
+        sw1, sw2 = resp[-2], resp[-1]
+        # ISO7816 GET RESPONSE for 61xx/9Fxx style continuation
+        if sw1 in {0x61, 0x9F}:
+            cla = original_apdu[0] if original_apdu else 0x00
+            get_resp = bytes((cla, 0xC0, 0x00, 0x00, sw2))
+            try:
+                extra = self.transmit(get_resp)
+                combined = resp + b"|" + extra
+                self._log_exchange(original_apdu, combined, context="apdu")
+                return combined
+            except Exception:
+                return resp
+        return resp
+
+    def test_tar(self, tar: bytes, keyset: int) -> bytes:
+        packet = build_command_packet(tar, keyset)
+        return self.transmit(build_sms_pp_download_apdu(packet))
+
+    def send_ota(self, pid: int, dcs: int, udhi: bool, cph: bytes, keyset: int, tar: str, fuzzer: FuzzerData) -> bytes:
+        _ = (udhi, cph)
+        tar_bytes = bytes.fromhex(tar.split(":", 1)[-1])
+        packet = build_command_packet(
+            tar_bytes,
+            keyset,
+            counter=fuzzer.counter,
+            request_por=fuzzer.request_por,
+            por_cc=fuzzer.request_por,
+        )
+        return self.transmit(build_sms_pp_download_apdu(packet, pid=pid, dcs=dcs))
+
+    def select_path(self, path: str) -> SimCardFileView:
+        # basic real probe: select by file id on tail
+        fid = path[-4:]
+        resp = self.transmit(bytes.fromhex(f"00A4000002{fid}"))
+        sw = resp[-2:]
+        if sw == b"\x90\x00":
+            return SimCardFileView(fid, "DF" if fid.startswith("7F") else "EF")
+        raise FileNotFoundError(path)
+
+
+def detect_available_readers() -> list[str]:
+    try:
+        from smartcard.System import readers as pcsc_readers
+
+        detected = [str(r) for r in pcsc_readers()]
+        if detected:
+            return detected
+    except Exception:
+        pass
+    env = os.getenv("SIMTESTER_READERS", "")
+    if env.strip():
+        return [r.strip() for r in env.split(",") if r.strip()]
+    return ["PC/SC Reader 0 (fallback)", "PC/SC Reader 1 (fallback)"]
+
+
+def apdu_scan(reader: ReaderBackend, writer: CSVWriter, level2: bool = False) -> None:
+    log_reader_atr(reader)
+    print(f"[{reader.name}] Starting APDU scan ({'L2' if level2 else 'L1'})")
+    for cla in range(0x100):
+        apdu = bytes((cla, 0, 0, 0, 0))
+        resp = reader.transmit(apdu)
+        resp_full = reader.maybe_get_response(apdu, resp)
+        parts = resp_full.split(b"|")
+        decoded = " || ".join(decode_apdu_response(p, context="apdu") for p in parts)
+        print(f"[{reader.name}] APDU {to_hex(apdu)} -> {to_hex(resp_full)} | {decoded}")
+        if not level2:
+            writer.write_line(reader.name, apdu, resp_full, decoded)
+        sw = int.from_bytes(resp[-2:], "big") if len(resp) >= 2 else 0xFFFF
+        if sw in {0x6E00, 0x6881, 0x6882}:
+            continue
+        if level2:
+            for ins in range(0x100):
+                apdu2 = bytes((cla, ins, 0, 0, 0))
+                resp2 = reader.transmit(apdu2)
+                resp2_full = reader.maybe_get_response(apdu2, resp2)
+                decoded2 = " || ".join(decode_apdu_response(p, context="apdu") for p in resp2_full.split(b"|"))
+                print(f"[{reader.name}] APDU {to_hex(apdu2)} -> {to_hex(resp2_full)} | {decoded2}")
+                writer.write_line(reader.name, apdu2, resp2_full, decoded2)
+
+
+def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, start: str, regex: str | None = None, keysets: list[int] | None = None) -> None:
+    log_reader_atr(reader)
+    patt = re.compile(regex) if regex else None
+    if mode == "scanAllTARs":
+        values = range(int(start, 16), 0x1000000)
+        tar_iter = (i.to_bytes(3, "big") for i in values)
+    elif mode == "scanWellKnownTARs":
+        tar_iter = (bytes.fromhex(t.split(":")[1]) for t in get_well_known_tars())
+    else:
+        values = range(0x000000, 0x010000)
+        tar_iter = (i.to_bytes(3, "big") for i in values)
+    keyset_list = keysets if keysets else [keyset]
+    for tar in tar_iter:
+        tar_hex = to_hex(tar)
+        tar_desc = tar_human_name(tar_hex)
+        for ks in keyset_list:
+            probe_apdu = build_sms_pp_download_apdu(build_command_packet(tar, ks))
+            resp = reader.test_tar(tar, ks)
+            resp_full = reader.maybe_get_response(probe_apdu, resp)
+            hx = to_hex(resp_full)
+            if patt and not patt.search(hx):
+                continue
+            decoded = " || ".join(decode_apdu_response(p, context="tar") for p in resp_full.split(b"|"))
+            if not tar_detected(resp):
+                # skip noisy non-detections
+                continue
+            human = f"{tar_desc}; keyset={ks}"
+            print(f"[{reader.name}] TAR {tar_hex} ({human}) -> {hx} | {decoded}")
+            writer.write_raw_line(f"{tar_hex},{ks},{human},{hx},{decoded}")
+
+
+def ota_fuzz(reader: ReaderBackend, writer: CSVWriter, keyset: int, tar: str, fuzzer_id: int, bruteforce: bool) -> None:
+    log_reader_atr(reader)
+    fuzzer = FUZZERS.get(fuzzer_id)
+    if not fuzzer:
+        raise ValueError(f"Unknown fuzzer: {fuzzer_id}")
+    pid_values = list(range(256)) if bruteforce else [0, 65, 124, 127]
+    dcs_values = list(range(256)) if bruteforce else [0, 22, 54, 86, 118, 150, 182, 214, 246]
+    for pid in pid_values:
+        for dcs in dcs_values:
+            resp = reader.send_ota(pid, dcs, False, b"", keyset, tar, fuzzer)
+            decoded = decode_apdu_response(resp, context="apdu")
+            print(f"[{reader.name}] OTA pid={pid:02X} dcs={dcs:02X} -> {to_hex(resp)} | {decoded}")
+            writer.write_raw_line(f"{pid:02X},{dcs:02X},{to_hex(resp)},{decoded}")
+
+
+def file_scan(reader: ReaderBackend, writer: CSVWriter, start_df: str, lazy_scan: bool) -> None:
+    log_reader_atr(reader)
+    writer.write_raw_line("# path,type")
+    for i in range(0x10000):
+        if lazy_scan and not (0x2F00 <= i <= 0x2FFF or 0x7F00 <= i <= 0x7FFF or 0x6F00 <= i <= 0x6FFF):
+            continue
+        path = f"{start_df}{i:04X}"
+        try:
+            entry = reader.select_path(path)
+            print(f"[{reader.name}] FILE {path} -> {entry.file_type}")
+            writer.write_raw_line(f"{path},{entry.file_type}")
+        except FileNotFoundError:
+            pass
+
+
+def _run_for_reader(reader_name: str, args) -> str:
+    try:
+        reader = ReaderBackend(reader_name, allow_dummy=args.allow_dummy)
+        writer = CSVWriter("UNKNOWN", args.cmd.upper(), reader_name)
+        if args.cmd == "apdu":
+            apdu_scan(reader, writer, args.level2)
+        elif args.cmd == "tar":
+            tar_scan(reader, writer, args.mode, args.keyset, args.start, args.regex, args.keysets)
+        elif args.cmd == "ota":
+            ota_fuzz(reader, writer, args.keyset, args.tar, args.fuzzer, args.bruteforce)
+        elif args.cmd == "file":
+            file_scan(reader, writer, args.start_df, args.lazy)
+        elif args.cmd == "fuzz":
+            writer.write_raw_line(f"# fuzz action selected: TARs={','.join(args.tars)} keysets={args.keysets} fuzzers={args.fuzzers}")
+        return writer.unhide()
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+def _menu(prompt: str, options: list[str], default: int = 0) -> str:
+    print(f"\n{prompt}")
+    for i, opt in enumerate(options, start=1):
+        print(f"  {i}. {opt}")
+    raw = input(f"Select [default {default + 1}]: ").strip()
+    if not raw:
+        return options[default]
+    return options[max(1, min(len(options), int(raw))) - 1]
+
+
+def _input_default(prompt: str, default: str) -> str:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    return raw if raw else default
+
+
+def interactive_menu() -> list[str]:
+    available_readers = detect_available_readers()
+    action = _menu("Select action", ["apdu", "tar", "ota", "file", "fuzz"])
+    print("\nAvailable SIM readers:")
+    for i, r in enumerate(available_readers, start=1):
+        print(f"  {i}. {r}")
+    readers_raw = _input_default("Reader indexes (comma-separated) or 'all'", "all")
+    if readers_raw.lower() == "all":
+        readers = ",".join(available_readers)
+    else:
+        picks = []
+        for tok in readers_raw.split(","):
+            tok = tok.strip()
+            if tok.isdigit() and 1 <= int(tok) <= len(available_readers):
+                picks.append(available_readers[int(tok) - 1])
+        readers = ",".join(picks or available_readers)
+
+    argv = ["--readers", readers, action]
+    if action == "apdu" and _menu("APDU scan level", ["level1", "level2"]) == "level2":
+        argv.append("--level2")
+    elif action == "tar":
+        print("Known TAR catalogs:")
+        for vendor, tars in WELL_KNOWN_TARS.items():
+            print(f"  - {vendor}: {', '.join(tars[:4])}")
+        argv += ["--mode", _menu("TAR mode", ["scanRangesOfTARs", "scanAllTARs", "scanWellKnownTARs"])]
+        argv += ["--keyset", _input_default("Primary keyset (0-15)", "1")]
+        multi_keysets = _input_default("Try multiple keysets (comma list, blank=disabled)", "")
+        if multi_keysets:
+            argv += ["--keysets", multi_keysets]
+        argv += ["--start", _input_default("Starting TAR (hex, 6 chars)", "000000").upper()]
+    elif action == "ota":
+        argv += ["--keyset", _input_default("Keyset (0-15)", "1")]
+        argv += ["--tar", _input_default("TAR", DEFAULT_TARS[0])]
+        argv += ["--fuzzer", _input_default(f"Fuzzer ID {list(FUZZERS.keys())}", "1")]
+    elif action == "file":
+        argv += ["--start-df", _input_default("Start DF", "3F00").upper()]
+    elif action == "fuzz":
+        argv += ["--keysets", _input_default("Keysets (comma list)", "1")]
+        argv += ["--fuzzers", _input_default("Fuzzer IDs (comma list)", "1")]
+        argv += ["--tars", _input_default("TARs (comma list)", ",".join(DEFAULT_TARS[:3]))]
+
+    if _menu("Allow dummy reader fallback?", ["no", "yes"]) == "yes":
+        argv = ["--allow-dummy"] + argv
+    return argv
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="simtester-tools")
+    parser.add_argument("--menu", action="store_true", help="Open interactive menu before scanning")
+    parser.add_argument("--readers", default="", help="Comma-separated reader names (full names accepted)")
+    parser.add_argument("--list-readers", action="store_true", help="List detected SIM readers and exit")
+    parser.add_argument("--allow-dummy", action="store_true", help="Allow dummy transport when real reader init fails")
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    apdu = sub.add_parser("apdu")
+    apdu.add_argument("--level2", action="store_true")
+
+    tar = sub.add_parser("tar")
+    tar.add_argument("--mode", choices=["scanAllTARs", "scanRangesOfTARs", "scanWellKnownTARs"], default="scanRangesOfTARs")
+    tar.add_argument("--keyset", type=int, default=1)
+    tar.add_argument("--start", default="000000")
+    tar.add_argument("--regex")
+    tar.add_argument("--keysets", type=lambda x: [int(i) for i in x.split(",")], default=None, help="Try multiple keysets, e.g. 1,3,5")
+
+    ota = sub.add_parser("ota")
+    ota.add_argument("--keyset", type=int, default=1)
+    ota.add_argument("--tar", default="RAM:000000")
+    ota.add_argument("--fuzzer", type=int, default=1)
+    ota.add_argument("--bruteforce", action="store_true")
+
+    filep = sub.add_parser("file")
+    filep.add_argument("--start-df", default="3F00")
+    filep.add_argument("--lazy", action="store_true")
+
+    fuzz = sub.add_parser("fuzz")
+    fuzz.add_argument("--keysets", type=lambda x: [int(i) for i in x.split(",")], default=[1])
+    fuzz.add_argument("--fuzzers", type=lambda x: [int(i) for i in x.split(",")], default=[1])
+    fuzz.add_argument("--tars", type=lambda x: [s.strip() for s in x.split(",")], default=DEFAULT_TARS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    parser = build_parser()
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["--menu"]
+
+    if "--list-readers" in argv:
+        for idx, name in enumerate(detect_available_readers(), start=1):
+            print(f"{idx}. {name}")
+        return 0
+
+    if "--menu" in argv:
+        argv = [x for x in argv if x != "--menu"]
+        argv = interactive_menu()
+
+    args = parser.parse_args(argv)
+    readers = [r.strip() for r in args.readers.split(",") if r.strip()] if args.readers.strip() else detect_available_readers()
+
+    failures = 0
+    with ThreadPoolExecutor(max_workers=len(readers)) as ex:
+        futures = {ex.submit(_run_for_reader, r, args): r for r in readers}
+        for fut in as_completed(futures):
+            res = fut.result()
+            reader_name = futures[fut]
+            if res.startswith("ERROR:"):
+                failures += 1
+                print(f"[{reader_name}] {res}")
+            else:
+                print(f"[{reader_name}] wrote {res}")
+    return 1 if failures == len(readers) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
