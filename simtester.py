@@ -441,10 +441,13 @@ def decode_atr(atr: bytes) -> dict[str, str]:
     offset = 2
     group = 1
     interface: list[str] = []
+    ta1: int | None = None
     protocols: set[int] = set()
     while present and offset < len(atr):
         for mask, name in ((1, "TA"), (2, "TB"), (4, "TC")):
             if present & mask and offset < len(atr):
+                if name == "TA" and group == 1:
+                    ta1 = atr[offset]
                 interface.append(f"{name}{group}={atr[offset]:02X}")
                 offset += 1
         if present & 8 and offset < len(atr):
@@ -467,7 +470,48 @@ def decode_atr(atr: bytes) -> dict[str, str]:
     tck_offset = offset + historical_length
     if any(protocol != 0 for protocol in protocols):
         result["ATR TCK"] = f"{atr[tck_offset]:02X}" if tck_offset < len(atr) else "missing"
+    ta1 = 0x11 if ta1 is None else ta1
+    fi_table = {1: (372, 5.0), 2: (558, 6.0), 3: (744, 8.0), 4: (1116, 12.0),
+                5: (1488, 16.0), 6: (1860, 20.0), 9: (512, 5.0),
+                10: (768, 7.5), 11: (1024, 10.0), 12: (1536, 15.0), 13: (2048, 20.0)}
+    di_table = {1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32, 8: 12, 9: 20}
+    fi = fi_table.get(ta1 >> 4)
+    di = di_table.get(ta1 & 15)
+    if fi and di:
+        factor, max_clock = fi
+        baud = int(max_clock * 1_000_000 * di / factor)
+        result["ATR PPS speed"] = (f"TA1={ta1:02X}, Fi={factor}, Di={di}, "
+                                   f"ETU={factor / di:g} clocks, max {baud} bit/s at {max_clock:g} MHz")
+        if ta1 == 0x11:
+            result["ATR PPS request"] = "default parameters; PPS not required"
+        else:
+            pps = bytes((0xFF, 0x10, ta1, 0xFF ^ 0x10 ^ ta1))
+            result["ATR PPS request"] = pps.hex().upper()
+    else:
+        result["ATR PPS speed"] = f"TA1={ta1:02X}, reserved/unsupported Fi or Di"
     return result
+
+
+VENDOR_MARKERS = (
+    (b"GEMPLUS", "Gemplus/Gemalto"), (b"GEMALTO", "Gemalto/Thales"),
+    (b"THALES", "Thales"), (b"OBERTHUR", "Oberthur/IDEMIA"),
+    (b"IDEMIA", "IDEMIA"), (b"MORPHO", "Morpho/IDEMIA"),
+    (b"GIESECKE", "Giesecke+Devrient"), (b"G&D", "Giesecke+Devrient"),
+    (b"WATCHDATA", "Watchdata"), (b"EASTCOM", "Eastcompeace"),
+    (b"VALID", "Valid"), (b"SYSMO", "sysmocom"),
+)
+
+
+def detect_sim_vendor(atr: bytes, manufacturer_area: bytes | None,
+                      gemxpresso_file: bool = False) -> tuple[str, str]:
+    """Conservative vendor match using public ATR text markers and vendor files."""
+    evidence = atr.upper() + b" " + (manufacturer_area or b"").upper()
+    for marker, vendor in VENDOR_MARKERS:
+        if marker in evidence:
+            return vendor, f"matched marker {marker.decode('ascii')} in ATR/manufacturer data"
+    if gemxpresso_file:
+        return "Gemplus/Gemalto", "vendor-specific GemXpresso DF 5F11 is present"
+    return "unknown", "no conservative public ATR/vendor-file signature matched"
 
 
 def _card_command(transport: CardTransport, command: bytes) -> APDUResponse:
@@ -518,11 +562,47 @@ def _read_first_record(transport: CardTransport, path: Sequence[int]) -> bytes |
     return None
 
 
+def _file_exists(transport: CardTransport, path: Sequence[int]) -> bool:
+    for cla in (0x00, 0xA0):
+        found = True
+        for fid in path:
+            response = _card_command(
+                transport, bytes((cla, 0xA4, 0, 0x04 if cla == 0 else 0, 2))
+                + fid.to_bytes(2, "big")
+            )
+            if response.sw != 0x9000:
+                found = False
+                break
+        if found:
+            return True
+    return False
+
+
+def _credential_status(transport: CardTransport, apdu_format: APDUFormat,
+                       instruction: int, reference: int) -> str:
+    command = bytes((apdu_format.select_cla, instruction, 0, reference))
+    try:
+        response = transport.transmit(command)
+    except Exception as exc:
+        return f"unavailable ({exc})"
+    if response.sw == 0x9000:
+        return "enabled and already verified"
+    if response.sw1 == 0x63 and response.sw2 & 0xF0 == 0xC0:
+        return f"enabled, {response.sw2 & 15} attempts remaining"
+    if response.sw in (0x6983, 0x9840):
+        return "blocked"
+    if response.sw in (0x6985, 0x9808):
+        return "disabled, already satisfied, or status contradiction"
+    if response.sw in (0x6A88, 0x9404):
+        return "not available"
+    return f"not reported (SW={response.sw:04X}: {decode_status_word(response.sw1, response.sw2).meaning})"
+
+
 def collect_sim_summary(transport: CardTransport,
                         apdu_format: APDUFormat | None = None) -> dict[str, str]:
     """Best-effort read of common subscriber identity files."""
     summary = {"ATR": "unavailable", "ICCID": "unavailable", "IMSI": "unavailable",
-               "MSISDN": "unavailable", "SPN": "unavailable"}
+               "MSISDN": "unavailable", "SPN": "unavailable", "SIM vendor": "unknown"}
     if apdu_format is not None:
         summary["APDU format"] = apdu_format.name
         summary["Supported command CLA"] = f"SELECT={apdu_format.select_cla:02X}, ENVELOPE={apdu_format.envelope_cla:02X}"
@@ -553,6 +633,22 @@ def collect_sim_summary(transport: CardTransport,
             if 1 < number_length <= 11:
                 number = _decode_bcd(footer[2:2 + number_length - 1])
                 summary["MSISDN"] = ("+" if footer[1] & 0x70 == 0x10 else "") + number
+        manufacturer = _read_transparent_file(transport, (0x3F00, 0x0002))
+        if manufacturer:
+            summary["Manufacturer area"] = manufacturer.hex().upper()
+        gemxpresso = _file_exists(transport, (0x3F00, 0x5F11))
+        atr_value = bytes.fromhex(summary["ATR"]) if summary["ATR"] != "unavailable" else b""
+        vendor, evidence = detect_sim_vendor(atr_value, manufacturer, gemxpresso)
+        summary["SIM vendor"] = vendor
+        summary["Vendor evidence"] = evidence
+        if apdu_format is not None:
+            pin2_reference = 0x81 if apdu_format.third_gen else 0x02
+            summary["PIN1 status"] = _credential_status(transport, apdu_format, 0x20, 0x01)
+            summary["PIN2 status"] = _credential_status(transport, apdu_format, 0x20, pin2_reference)
+            # A zero-data RESET RETRY COUNTER is the standardized status query;
+            # it does not submit a PUK and therefore does not consume an attempt.
+            summary["PUK1 status"] = _credential_status(transport, apdu_format, 0x2C, 0x01)
+            summary["PUK2 status"] = _credential_status(transport, apdu_format, 0x2C, pin2_reference)
     except Exception as exc:
         summary["Read status"] = f"partial ({exc})"
     return summary
@@ -1061,7 +1157,7 @@ def run_self_tests() -> int:
             def transmit(self, apdu: bytes) -> APDUResponse:
                 if apdu[1] == 0xA4:
                     self.selected = int.from_bytes(apdu[-2:], "big")
-                    return APDUResponse(b"", 0x90, 0)
+                    return APDUResponse(b"", 0x6A, 0x82) if self.selected == 0x5F11 else APDUResponse(b"", 0x90, 0)
                 files = {
                     0x2FE2: bytes.fromhex("981032547698103254F6"),
                     0x6F07: bytes.fromhex("082943658709214365"),
@@ -1079,8 +1175,15 @@ def run_self_tests() -> int:
         assert summary["IMSI"] == "234567890123456"
         assert summary["MSISDN"] == "+1234567890"
         assert summary["SPN"] == "Carrier"
+        assert summary["PIN1 status"] == "enabled and already verified"
+        assert summary["SIM vendor"] == "unknown"
         t1 = decode_atr(bytes.fromhex("3B800181"))
         assert t1["ATR protocols"] == "T=1" and t1["ATR TCK"] == "81"
+        fast = decode_atr(bytes.fromhex("3B1094"))
+        assert "78125 bit/s" in fast["ATR PPS speed"]
+        assert fast["ATR PPS request"] == "FF10947B"
+        vendor = detect_sim_vendor(b"3B GEMALTO", None)
+        assert vendor[0] == "Gemalto/Thales"
 
     failures = 0
     for name, function in checks:

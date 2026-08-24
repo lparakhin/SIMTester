@@ -79,6 +79,11 @@ APDU classes are attempted; protected or absent fields are shown as unavailable.
 ATR details include convention, supported T= protocols, interface bytes,
 historical bytes/text, and TCK where applicable. The summary also states the
 detected 2G/3G format and supported SELECT/ENVELOPE CLA values.
+TA1 is decoded into Fi, Di, ETU clocks, maximum PPS bit rate and the applicable
+PPS request. Vendor detection conservatively matches public ATR/manufacturer
+text signatures and the vendor-specific GemXpresso `5F11` directory, always
+showing its evidence or `unknown`. Zero-data status queries report PIN1, PIN2,
+PUK1, and PUK2 availability, blocking state, and remaining attempts when given.
 Before scanning, the selected card is probed with SELECT MF in modern UICC and
 classic SIM forms. The detected 3G (`00`/`80`) or 2G (`A0`) CLA format is then
 used automatically for ENVELOPE and GET RESPONSE commands.

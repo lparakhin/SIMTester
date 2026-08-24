@@ -15,6 +15,7 @@
 > Every scan ends with a best-effort ATR, ICCID, IMSI, MSISDN, and SPN summary.
 > The card's classic 2G SIM or modern 3G/UICC APDU format is detected automatically.
 > ATR protocol details and supported CLAs are decoded; final summaries retain only findings.
+> PPS speed, conservative SIM-vendor evidence, and PIN/PUK status are also reported.
 
 SIMTester assess SIM card security in two dimensions:
 
