@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
@@ -170,6 +171,84 @@ class APDUResponse:
         return self.sw1 << 8 | self.sw2
 
 
+@dataclass(frozen=True)
+class StatusWordInfo:
+    meaning: str
+    category: str
+    standard: str
+
+
+def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
+    """Decode ISO/ETSI/3GPP UICC status words also used by GSMA profiles."""
+    sw = sw1 << 8 | sw2
+    exact = {
+        0x9000: ("Command completed successfully", "success"),
+        0x6282: ("End of file or record reached before reading Le bytes", "warning"),
+        0x6283: ("Selected file invalidated/deactivated", "warning"),
+        0x6285: ("Selected file is in termination state", "warning"),
+        0x6700: ("Wrong command length", "error"),
+        0x6881: ("Logical channel not supported", "unsupported"),
+        0x6882: ("Secure messaging not supported", "unsupported"),
+        0x6982: ("Security status not satisfied", "security"),
+        0x6983: ("Authentication method blocked", "security"),
+        0x6984: ("Referenced data invalidated", "security"),
+        0x6985: ("Conditions of use not satisfied", "security"),
+        0x6986: ("Command not allowed (no current EF or command context)", "supported-command"),
+        0x6988: ("Secure messaging data objects incorrect", "security"),
+        0x6A80: ("Incorrect parameters in command data", "supported-command"),
+        0x6A81: ("Function not supported", "unsupported"),
+        0x6A82: ("File or application not found", "supported-command"),
+        0x6A83: ("Record not found", "supported-command"),
+        0x6A84: ("Not enough memory space", "error"),
+        0x6A86: ("Incorrect P1/P2 parameters", "supported-command"),
+        0x6A87: ("Lc inconsistent with P1/P2", "supported-command"),
+        0x6A88: ("Referenced data not found", "supported-command"),
+        0x6B00: ("Wrong P1/P2 parameters", "supported-command"),
+        0x6D00: ("Instruction code (INS) not supported or invalid", "unsupported"),
+        0x6E00: ("Class byte (CLA) not supported", "unsupported"),
+        0x6F00: ("No precise diagnosis", "error"),
+        0x9300: ("SIM Application Toolkit is busy", "warning"),
+        0x9400: ("No EF selected", "supported-command"),
+        0x9402: ("Out of range or invalid address", "supported-command"),
+        0x9404: ("File ID or pattern not found", "supported-command"),
+        0x9802: ("No PIN/CHV initialized", "security"),
+        0x9804: ("Access condition not fulfilled", "security"),
+        0x9808: ("PIN/CHV status contradiction", "security"),
+        0x9840: ("PIN/CHV or authentication key blocked", "security"),
+    }
+    if sw in exact:
+        meaning, category = exact[sw]
+        standard = "ETSI TS 102 221 / 3GPP TS 31.101"
+        if sw1 in (0x93, 0x94, 0x98):
+            standard = "3GPP TS 11.11 legacy SIM"
+        return StatusWordInfo(meaning, category, standard)
+    if sw1 == 0x61:
+        return StatusWordInfo(f"{sw2 or 256} response bytes available", "response-available",
+                              "ISO/IEC 7816-4 / ETSI TS 102 221")
+    if sw1 == 0x91:
+        return StatusWordInfo(f"Command successful; {sw2 or 256} proactive command bytes available",
+                              "proactive", "ETSI TS 102 223 / 3GPP TS 31.111")
+    if sw1 == 0x9F:
+        return StatusWordInfo(f"Command successful; {sw2 or 256} GET RESPONSE bytes available",
+                              "response-available", "3GPP TS 11.11 legacy SIM")
+    if sw1 == 0x62:
+        return StatusWordInfo("Warning: non-volatile memory unchanged", "warning",
+                              "ISO/IEC 7816-4 / ETSI TS 102 221")
+    if sw1 == 0x63:
+        retries = sw2 & 0x0F
+        meaning = f"Verification failed; {retries} retries remaining" if sw2 & 0xF0 == 0xC0 else "Warning: non-volatile memory changed"
+        return StatusWordInfo(meaning, "security" if sw2 & 0xF0 == 0xC0 else "warning",
+                              "ISO/IEC 7816-4 / ETSI TS 102 221")
+    if sw1 == 0x64:
+        return StatusWordInfo("Execution error; non-volatile memory unchanged", "error", "ISO/IEC 7816-4")
+    if sw1 == 0x65:
+        return StatusWordInfo("Execution error; non-volatile memory changed", "error", "ISO/IEC 7816-4")
+    if sw1 == 0x6C:
+        return StatusWordInfo(f"Wrong Le; exact length is {sw2 or 256}", "supported-command", "ISO/IEC 7816-4")
+    return StatusWordInfo("Unknown or application-specific status word", "unknown",
+                          "Consult card application and GSMA profile specification")
+
+
 class CardTransport(Protocol):
     def transmit(self, apdu: bytes) -> APDUResponse: ...
     def close(self) -> None: ...
@@ -330,38 +409,73 @@ def _run_scan(reader: int, level2: bool) -> None:
     if not 0 <= reader < len(reader_names):
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
+    status_counts: Counter[int] = Counter()
+    category_counts: Counter[str] = Counter()
+    error_count = 0
 
     def screen_trace(sequence: int, total: int, command: bytes,
                      response: APDUTraceValue, found: bool | None) -> None:
+        nonlocal error_count
         if response is None:
             print(f"[{sequence:05d}/{total:05d}] TX APDU={command.hex().upper()}", flush=True)
             return
         if isinstance(response, Exception):
+            error_count += 1
             action = "retrying" if found else "SKIPPED"
             print(f"[{sequence:05d}/{total:05d}] ERROR {type(response).__name__}: "
                   f"{response} - {action}", flush=True)
             return
         data = response.data.hex().upper() or "<empty>"
+        info = decode_status_word(response.sw1, response.sw2)
+        status_counts[response.sw] += 1
+        category_counts[info.category] += 1
         result = "FOUND" if found else "filtered"
-        print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} {result}",
-              flush=True)
+        print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
+              f"{result} - {info.meaning} [{info.standard}]", flush=True)
 
     transport = PCSCTransport(reader)
-    findings = 0
+    findings: list[ScanFinding] = []
+    aborted = False
     try:
         for finding in scan_apdus(transport, level2=level2, trace=screen_trace):
-            findings += 1
+            findings.append(finding)
             response = finding.response
             print(f"FINDING VALUE={finding.value:04X} SW={response.sw:04X} "
                   f"DATA={response.data.hex().upper() or '<empty>'}", flush=True)
     except RuntimeError as exc:
+        aborted = True
         print(f"SCAN ABORTED: {exc}", flush=True)
     finally:
         try:
             transport.close()
         except Exception as exc:
             print(f"CARD CLOSE ERROR: {exc}", flush=True)
-        print(f"SCAN END: {findings} potentially supported APDU values found", flush=True)
+        print("\n========== APDU SCAN SUMMARY ==========", flush=True)
+        print(f"Result: {'ABORTED' if aborted else 'COMPLETED'}", flush=True)
+        print(f"Responses received: {sum(status_counts.values())}", flush=True)
+        print(f"Communication errors/retries: {error_count}", flush=True)
+        print(f"Potentially supported APDU values: {len(findings)}", flush=True)
+        print("Status words:", flush=True)
+        for sw, count in status_counts.most_common():
+            info = decode_status_word(sw >> 8, sw & 0xFF)
+            print(f"  SW={sw:04X} COUNT={count} CATEGORY={info.category} - {info.meaning}", flush=True)
+        print("Categories:", flush=True)
+        for category, count in category_counts.most_common():
+            print(f"  {category}: {count}", flush=True)
+        print("Findings:", flush=True)
+        if findings:
+            for finding in findings:
+                response = finding.response
+                info = decode_status_word(response.sw1, response.sw2)
+                print(f"  CLA={finding.value >> 8:02X} INS={finding.value & 0xFF:02X} "
+                      f"APDU={finding.value:04X}0000 SW={response.sw:04X} "
+                      f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
+        else:
+            print("  None", flush=True)
+        print("Standards basis: ISO/IEC 7816-4, ETSI TS 102 221/102 223, "
+              "3GPP TS 31.101/31.111 and legacy TS 11.11; GSMA UICC/eSIM "
+              "profiles use these card status conventions unless profile-specific.", flush=True)
+        print("=======================================", flush=True)
 
 
 def run_self_tests() -> int:
@@ -389,6 +503,14 @@ def run_self_tests() -> int:
         response = ResponsePacket.parse(raw, strict=False)
         assert response.tar == bytes.fromhex("B00010")
         assert response.counter == 1 and response.additional_data == bytes.fromhex("AABB")
+
+    @check("ETSI and 3GPP status word decoding")
+    def _status_words() -> None:
+        assert decode_status_word(0x90, 0x00).category == "success"
+        assert "Instruction" in decode_status_word(0x6D, 0x00).meaning
+        assert decode_status_word(0x69, 0x86).category == "supported-command"
+        assert "3 retries" in decode_status_word(0x63, 0xC3).meaning
+        assert "256" in decode_status_word(0x61, 0x00).meaning
 
     @check("TAR generation is inclusive and resumable")
     def _tar_generation() -> None:

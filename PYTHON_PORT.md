@@ -45,6 +45,12 @@ to copy, run, and test without a physical SIM.
 * Transient PC/SC errors are logged and retried after reconnecting. A repeatedly
   failing APDU is skipped, while persistent reader/card failure stops the scan
   cleanly after ten consecutive errors instead of displaying a traceback.
+* Every card status word is decoded against ISO/IEC 7816-4, ETSI TS 102 221 and
+  TS 102 223, 3GPP TS 31.101 and TS 31.111, with legacy TS 11.11 SIM meanings.
+  These are the card conventions referenced by GSMA UICC/eSIM profiles; unknown
+  values are explicitly marked application/profile-specific rather than guessed.
+* Completed or aborted scans print totals, communication errors, status-word and
+  category counts, and a decoded table of every potentially supported CLA/INS.
 * Non-interactive subcommands for automation and dependency-free self-tests.
 
 There is nothing to install and no second Python source file. Examples:

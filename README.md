@@ -6,6 +6,7 @@
 > menu or `python simtester.py self-test` for its built-in tests. No installation
 > or additional Python source files are required. See [PYTHON_PORT.md](PYTHON_PORT.md).
 > APDU scans display every command and response on screen as they run.
+> At the end, they print decoded ETSI/3GPP status words and a complete findings summary.
 
 SIMTester assess SIM card security in two dimensions:
 
