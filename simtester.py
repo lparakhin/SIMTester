@@ -15,7 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
+BUILD_ID = "uicc-status-le-v2"
 
 
 class PacketError(ValueError):
@@ -770,14 +771,28 @@ def detect_sim_vendor(atr: bytes, manufacturer_area: bytes | None,
 
 def _card_command(transport: CardTransport, command: bytes) -> APDUResponse:
     """Transmit a summary APDU and handle 61xx and 6Cxx responses."""
-    response = transport.transmit(command)
-    if response.sw1 == 0x6C:
-        response = transport.transmit(command[:-1] + bytes((response.sw2,)))
+    response, _exchanges = _card_command_trace(transport, command)
+    return response
+
+
+def _card_command_trace(
+    transport: CardTransport, command: bytes
+) -> tuple[APDUResponse, tuple[tuple[bytes, APDUResponse], ...]]:
+    """Transmit with bounded Le correction/GET RESPONSE and retain each exchange."""
+    current = command
+    response = transport.transmit(current)
+    exchanges = [(current, response)]
+    if response.sw1 == 0x6C and current:
+        current = current[:-1] + bytes((response.sw2,))
+        response = transport.transmit(current)
+        exchanges.append((current, response))
     data = response.data
     while response.sw1 in (0x61, 0x9F):
-        response = transport.transmit(bytes((command[0], 0xC0, 0, 0, response.sw2)))
+        current = bytes((command[0], 0xC0, 0, 0, response.sw2))
+        response = transport.transmit(current)
+        exchanges.append((current, response))
         data += response.data
-    return APDUResponse(data, response.sw1, response.sw2)
+    return APDUResponse(data, response.sw1, response.sw2), tuple(exchanges)
 
 
 def _read_transparent_file(transport: CardTransport, path: Sequence[int]) -> bytes | None:
@@ -1111,6 +1126,27 @@ class TARContextResult:
     command: bytes
     response: APDUResponse
     analysis: ResponseAnalysis
+    exchanges: tuple[tuple[bytes, APDUResponse], ...] = ()
+
+
+def analyze_tar_context_response(name: str, command: bytes,
+                                 response: APDUResponse) -> ResponseAnalysis:
+    """Interpret STATUS/GET DATA without confusing optional support with TARs."""
+    if name.startswith("STATUS"):
+        if response.sw == 0x9000:
+            detail = " and returned status/FCP data" if response.data else " with no response data"
+            return ResponseAnalysis(True, "medium", f"ETSI UICC STATUS succeeded{detail}",
+                                    "Decode returned FCP/TLV data; this does not identify a TAR")
+        if response.sw1 == 0x6C:
+            return ResponseAnalysis(True, "medium", "UICC STATUS recognized, but corrected Le was not accepted",
+                                    f"Card continues to request Le={response.sw2 or 256}; do not infer TAR support")
+    if name.startswith("GET DATA") and response.sw in (0x6D00, 0x6E00, 0x6A81, 0x6A88):
+        return ResponseAnalysis(False, "none",
+                                "Optional ISO GET DATA object is unavailable in this UICC command context",
+                                "Treat as a context capability result, not evidence for or against OTA/TAR support")
+    generic = analyze_apdu_response(command, response)
+    return ResponseAnalysis(generic.interesting, generic.severity, generic.conclusion,
+                            generic.next_step + "; do not infer a TAR from this context command")
 
 
 def probe_tar_scan_context(transport: CardTransport,
@@ -1118,19 +1154,19 @@ def probe_tar_scan_context(transport: CardTransport,
     """Issue read-only GET STATUS/GET DATA context probes around a TAR scan."""
     if apdu_format.third_gen:
         commands = (
-            ("GET STATUS application templates", bytes.fromhex("80F20000024F0000")),
+            ("STATUS current UICC application", bytes.fromhex("80F2000000")),
             ("GET DATA card recognition data", bytes.fromhex("00CA006600")),
         )
     else:
         commands = (
-            ("GET STATUS", bytes.fromhex("A0F2000000")),
+            ("STATUS current SIM application", bytes.fromhex("A0F2000000")),
             ("GET DATA card recognition data", bytes.fromhex("A0CA006600")),
         )
     results = []
     for name, command in commands:
-        response = _card_command(transport, command)
+        response, exchanges = _card_command_trace(transport, command)
         results.append(TARContextResult(
-            name, command, response, analyze_apdu_response(command, response)
+            name, command, response, analyze_tar_context_response(name, command, response), exchanges
         ))
     return results
 
@@ -1138,6 +1174,22 @@ def probe_tar_scan_context(transport: CardTransport,
 def ensure_por_requested(packet: CommandPacket) -> CommandPacket:
     """Return a packet whose SPI requests PoR without mutating the caller's packet."""
     return replace(packet, request_por=True, fake_spi2=None)
+
+
+def classify_tar_scan_results(
+    results: Sequence[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]],
+) -> tuple[tuple[int, bytes], int,
+           list[tuple[str, str, CommandPacket, APDUResponse, ResponsePacket | None]]]:
+    """Separate repeated no-PoR transport behavior from differential findings."""
+    signatures = Counter(
+        (result[3].sw, result[3].data) for result in results if result[4] is None
+    )
+    baseline, count = signatures.most_common(1)[0] if signatures else ((0, b""), 0)
+    findings = [
+        result for result in results
+        if result[4] is not None or count <= 1 or (result[3].sw, result[3].data) != baseline
+    ]
+    return baseline, count, findings
 
 
 def _hex(prompt: str, *, length: int | None = None, default: str = "") -> bytes:
@@ -1283,17 +1335,20 @@ def _run_known_tar_scan(reader: int, keyset: int,
     context_results: list[TARContextResult] = []
     errors = 0
     print(f"{title} START: {len(probe_list)} probes; reader {reader}: "
-          f"{reader_names[reader]}; keyset {keyset}", flush=True)
+          f"{reader_names[reader]}; keyset {keyset}; "
+          f"SIMTester Python {__version__} ({BUILD_ID})", flush=True)
     try:
         print("Read-only card context probes:", flush=True)
         try:
             for context in probe_tar_scan_context(transport, apdu_format):
                 context_results.append(context)
-                info = decode_status_word(context.response.sw1, context.response.sw2)
-                print(f"  {context.name} TX={context.command.hex().upper()} "
-                      f"RX={context.response.data.hex().upper() or '<empty>'} "
-                      f"SW={context.response.sw:04X} - {info.meaning}; "
-                      f"ANALYSIS={context.analysis.conclusion}; "
+                for exchange_index, (exchange_command, exchange_response) in enumerate(context.exchanges, 1):
+                    info = decode_status_word(exchange_response.sw1, exchange_response.sw2)
+                    print(f"  {context.name} [{exchange_index}/{len(context.exchanges)}] "
+                          f"TX={exchange_command.hex().upper()} "
+                          f"RX={exchange_response.data.hex().upper() or '<empty>'} "
+                          f"SW={exchange_response.sw:04X} - {info.meaning}", flush=True)
+                print(f"    ANALYSIS={context.analysis.conclusion}; "
                       f"NEXT={context.analysis.next_step}", flush=True)
         except Exception as exc:
             errors += 1
@@ -1351,11 +1406,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
         except Exception:
             pass
     parsed_results = [result for result in results if result[4] is not None]
-    interesting_results = [
-        result for result in results
-        if result[4] is not None or result[3].data
-        or result[3].sw not in (0x9000, 0x6D00, 0x6E00)
-    ]
+    baseline_signature, baseline_count, interesting_results = classify_tar_scan_results(results)
     insecure = [result for result in parsed_results
                 if result[4].status_code == 0 and requested_msl(result[2]).startswith("MSL=0")]
     por_requested = sum(1 for result in results if result[2].request_por)
@@ -1364,11 +1415,21 @@ def _run_known_tar_scan(reader: int, keyset: int,
     msl_successes = Counter(requested_msl(result[2]) for result in parsed_results
                             if result[4].status_code == 0)
     print(f"\n========== {title} SUMMARY ==========", flush=True)
+    print(f"Tool build: SIMTester Python {__version__} ({BUILD_ID})", flush=True)
     print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
     print(f"PoR support: {por_received}/{por_requested} requested PoR packets received", flush=True)
+    if baseline_count:
+        baseline_sw, baseline_data = baseline_signature
+        baseline_info = decode_status_word(baseline_sw >> 8, baseline_sw & 0xFF)
+        print(f"Dominant no-PoR baseline: {baseline_count}/{len(results)} responses "
+              f"SW={baseline_sw:04X} DATA={baseline_data.hex().upper() or '<empty>'} "
+              f"- {baseline_info.meaning}", flush=True)
+        if baseline_sw >> 8 == 0x62:
+            print("  Analysis: ENVELOPE produced the same warning for unrelated TARs; "
+                  "this is transport/parser behavior, not evidence that any listed TAR exists.", flush=True)
     print("GET STATUS / GET DATA context:", flush=True)
     for context in context_results:
         info = decode_status_word(context.response.sw1, context.response.sw2)
@@ -1383,7 +1444,7 @@ def _run_known_tar_scan(reader: int, keyset: int,
         print(f"  {level}: responses={attempts}, successful-PoR={msl_successes[level]}", flush=True)
     if insecure:
         print(f"WARNING: {len(insecure)} UNSECURE MSL=0 command(s) succeeded", flush=True)
-    print(f"Interesting findings: {len(interesting_results)}", flush=True)
+    print(f"Interesting differential/PoR findings: {len(interesting_results)}", flush=True)
     for group, tar, packet, response, parsed in interesting_results:
         info = decode_status_word(response.sw1, response.sw2)
         ota = (f" OTA-RSC={parsed.status_code:02X}({decode_por_status(parsed.status_code)})"
@@ -1668,23 +1729,36 @@ def run_self_tests() -> int:
 
         def context_card(apdu: bytes) -> APDUResponse:
             commands.append(apdu)
-            if apdu == bytes.fromhex("80F20000024F0000"):
-                return APDUResponse(b"", 0x61, 0x02)
-            if apdu == bytes.fromhex("80C0000002"):
-                return APDUResponse(b"OK", 0x90, 0x00)
+            if apdu == bytes.fromhex("80F2000000"):
+                return APDUResponse(b"", 0x6C, 0x2B)
+            if apdu == bytes.fromhex("80F200002B"):
+                return APDUResponse(b"FCP", 0x90, 0x00)
             return APDUResponse(b"", 0x6A, 0x88)
 
         context = probe_tar_scan_context(
             MockTransport(context_card), APDUFormat("3G/UICC", True, 0, 0x80)
         )
         assert [item.name for item in context] == [
-            "GET STATUS application templates", "GET DATA card recognition data"
+            "STATUS current UICC application", "GET DATA card recognition data"
         ]
-        assert context[0].response == APDUResponse(b"OK", 0x90, 0x00)
+        assert context[0].response == APDUResponse(b"FCP", 0x90, 0x00)
+        assert "UICC STATUS succeeded" in context[0].analysis.conclusion
         assert context[1].response.sw == 0x6A88
+        assert not context[1].analysis.interesting
+        assert "Optional ISO GET DATA" in context[1].analysis.conclusion
         assert commands == [bytes.fromhex(value) for value in (
-            "80F20000024F0000", "80C0000002", "00CA006600"
+            "80F2000000", "80F200002B", "00CA006600"
         )]
+        packet = CommandPacket(bytes.fromhex("000000"))
+        scan_rows = [
+            ("RAM", f"{index:06X}", packet, APDUResponse(b"", 0x62, 0), None)
+            for index in range(3)
+        ]
+        scan_rows.append(("RAM", "000003", packet, APDUResponse(b"PoR", 0x90, 0),
+                          ResponsePacket(None, None, 0, 0, None, b"", b"")))
+        baseline, count, findings = classify_tar_scan_results(scan_rows)
+        assert baseline == (0x6200, b"") and count == 3
+        assert len(findings) == 1 and findings[0][4] is not None
 
     @check("automatic 2G and 3G APDU format detection")
     def _apdu_format_detection() -> None:
@@ -1930,6 +2004,8 @@ def interactive_menu() -> int:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version",
+                        version=f"SIMTester Python {__version__} ({BUILD_ID})")
     commands = parser.add_subparsers(dest="command")
     build = commands.add_parser("build-ota")
     build.add_argument("tar"); build.add_argument("--keyset", type=int, default=0)

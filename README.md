@@ -24,7 +24,9 @@
 > OTA summaries correlate PID/DCS/UDHI differences and distinguish empty 9000 from PoR.
 > Repeated DCS/UDHI `9000`/`62xx` patterns are identified as parser-path evidence,
 > while PID-independent behavior is called out and never treated as OTA execution.
-> TAR scans always request PoR and add analyzed GET STATUS/GET DATA context probes.
+> TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
+> Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
+> Use `python simtester.py --version`; corrected scans identify build `uicc-status-le-v2`.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:

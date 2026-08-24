@@ -126,10 +126,16 @@ uses DCS `00` as a control, and reports when PID `00`/`40`/`7F` is independent.
 This is classified as evidence that a different UICC parser path was reached,
 not as evidence that the secured command executed or that a TAR is unprotected.
 Every TAR probe now requests PoR, including caller-supplied packets that omitted
-the request bit. Before delivery, the TAR workflow sends read-only GET STATUS and
-GET DATA context probes in the detected 2G or 3G command form, follows `61xx` and
-`6Cxx`, and includes decoded status, severity, response data, and conclusions in
-both the live log and final summary.
+the request bit. Before delivery, the TAR workflow sends the generation-specific
+ETSI UICC/SIM STATUS command and an optional ISO GET DATA card-recognition probe,
+follows `61xx`, `9Fxx`, and `6Cxx`, and logs every initial and corrected exchange.
+`6D00` from optional GET DATA is reported as a context capability result rather
+than evidence against OTA support. Repeated empty `62xx` replies are collapsed
+into a dominant transport/parser baseline instead of listing every TAR as found.
+TAR scan headers include the tool version and build identifier. If output still
+says `GET STATUS application templates` or `Interesting findings: 135`, it came
+from an older copied script; `python simtester.py --version` identifies the file
+being executed, and the corrected build reports `uicc-status-le-v2`.
 
 There is nothing to install and no second Python source file. Examples:
 
