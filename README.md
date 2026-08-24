@@ -18,6 +18,7 @@
 > PPS speed, conservative SIM-vendor evidence, and PIN/PUK status are also reported.
 > PIN2/PUK2 status automatically falls back across UICC and classic SIM references.
 > ATR identity uses the pcsc-tools public database; scans report MSL/PoR coverage and warnings.
+> EFTLab's ATR list is a second source, and SW analysis adds severity and next-step guidance.
 
 SIMTester assess SIM card security in two dimensions:
 

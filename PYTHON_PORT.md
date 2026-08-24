@@ -97,6 +97,11 @@ ATR identity/vendor lookup uses the public pcsc-tools database at
 to an updated local copy for offline use. Standard fuzzing reports coverage for
 every requested MSL combination, PoR support, decoded PoR status, and a prominent
 warning whenever an MSL=0 command succeeds without command security.
+EFTLab's Complete List of ATRs at
+`https://www.eftlab.com/knowledge-base/complete-list-of-atrs` is queried as a
+second source; `SIMTESTER_EFTLAB_ATR_DATABASE` accepts an offline HTML copy.
+APDU findings now include contextual support confidence, severity, conclusions,
+and a recommended next step instead of relying on the status-word label alone.
 
 There is nothing to install and no second Python source file. Examples:
 

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import json
 import os
+import re
 import time
 import urllib.request
 from collections import Counter
@@ -290,6 +292,49 @@ class StatusWordInfo:
     standard: str
 
 
+@dataclass(frozen=True)
+class ResponseAnalysis:
+    interesting: bool
+    severity: str
+    conclusion: str
+    next_step: str
+
+
+def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAnalysis:
+    """Add command-context intelligence to a raw status-word interpretation."""
+    sw = response.sw
+    if sw == 0x9000:
+        return ResponseAnalysis(True, "high", "CLA and INS accepted; command succeeded",
+                                "Inspect returned data and verify whether authorization was expected")
+    if response.sw1 in (0x61, 0x9F):
+        return ResponseAnalysis(True, "high", "Command accepted and response bytes are available",
+                                f"Issue GET RESPONSE with Le={response.sw2 or 256}")
+    if response.sw1 == 0x6C:
+        return ResponseAnalysis(True, "high", "INS is recognized; only Le is wrong",
+                                f"Retry with Le={response.sw2 or 256}")
+    if sw in (0x6700, 0x6A80, 0x6A86, 0x6A87, 0x6A88, 0x6B00):
+        return ResponseAnalysis(True, "medium", "CLA/INS likely recognized; parameters or data are invalid",
+                                "Refine P1/P2, Lc, data, and Le without treating this as unsupported")
+    if response.sw1 == 0x69 or sw in (0x9804, 0x9840):
+        return ResponseAnalysis(True, "high", "Command recognized but blocked by security or card state",
+                                "Review PIN, access rules, selected file/application, and secure messaging")
+    if response.sw1 == 0x63 and response.sw2 & 0xF0 == 0xC0:
+        return ResponseAnalysis(True, "critical", f"Credential check failed; {response.sw2 & 15} tries remain",
+                                "Do not retry credentials automatically")
+    if sw == 0x6D00:
+        return ResponseAnalysis(False, "none", "INS unsupported for this CLA", "Continue with the next INS")
+    if sw == 0x6E00:
+        return ResponseAnalysis(False, "none", "CLA unsupported", "Skip the remaining INS values for this CLA")
+    if sw in (0x6881, 0x6882):
+        return ResponseAnalysis(False, "low", "CLA understood, but channel or secure-messaging function unsupported",
+                                "Try the basic channel without secure messaging")
+    if response.data:
+        return ResponseAnalysis(True, "medium", "Application-specific status returned data",
+                                "Decode response data using the selected application specification")
+    return ResponseAnalysis(True, "low", "Non-generic or application-specific status",
+                            "Correlate with card state and application documentation")
+
+
 def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
     """Decode ISO/ETSI/3GPP UICC status words also used by GSMA profiles."""
     sw = sw1 << 8 | sw2
@@ -538,7 +583,9 @@ VENDOR_MARKERS = (
 )
 
 ATR_DATABASE_URL = "https://pcsc-tools.apdu.fr/smartcard_list.txt"
+EFTLAB_ATR_URL = "https://www.eftlab.com/knowledge-base/complete-list-of-atrs"
 _ATR_DATABASE_CACHE: tuple[str | None, str] | None = None
+_EFTLAB_ATR_CACHE: tuple[str | None, str] | None = None
 
 
 def load_atr_database() -> tuple[str | None, str]:
@@ -560,6 +607,52 @@ def load_atr_database() -> tuple[str | None, str]:
     except Exception as exc:
         _ATR_DATABASE_CACHE = None, f"unavailable ({exc}); set SIMTESTER_ATR_DATABASE to a local copy"
     return _ATR_DATABASE_CACHE
+
+
+def _eftlab_html_to_database(page: str) -> str:
+    """Convert EFTLab's ATR HTML table into the simple pcsc-tools entry form."""
+    text = re.sub(r"<(?:br|/p|/tr|/td|/li)\b[^>]*>", "\n", page, flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    entries: list[str] = []
+    atr_pattern = re.compile(r"\b(?:3B|3F)(?:[ :\-]*(?:[0-9A-Fa-f]{2}|\.\.)){1,}\b")
+    for index, line in enumerate(lines):
+        match = atr_pattern.search(line)
+        if not match:
+            continue
+        raw = re.sub(r"[^0-9A-Fa-f.]", "", match.group()).upper()
+        if len(raw) < 4 or len(raw) % 2:
+            continue
+        description = line[match.end():].strip(" :-")
+        if not description and index + 1 < len(lines):
+            description = lines[index + 1]
+        entries.append(" ".join(raw[pos:pos + 2] for pos in range(0, len(raw), 2))
+                       + "\n\t" + (description or "EFTLab ATR entry"))
+    return "\n\n".join(entries)
+
+
+def load_eftlab_atr_database() -> tuple[str | None, str]:
+    """Load and normalize EFTLab's Complete List of ATRs."""
+    global _EFTLAB_ATR_CACHE
+    if _EFTLAB_ATR_CACHE is not None:
+        return _EFTLAB_ATR_CACHE
+    local_path = os.environ.get("SIMTESTER_EFTLAB_ATR_DATABASE")
+    try:
+        if local_path:
+            with open(local_path, "r", encoding="utf-8", errors="replace") as database:
+                page = database.read()
+            source = local_path
+        else:
+            with urllib.request.urlopen(EFTLAB_ATR_URL, timeout=4) as response:
+                page = response.read().decode("utf-8", "replace")
+            source = EFTLAB_ATR_URL
+        normalized = _eftlab_html_to_database(page)
+        _EFTLAB_ATR_CACHE = normalized, source
+    except Exception as exc:
+        _EFTLAB_ATR_CACHE = None, (
+            f"unavailable ({exc}); set SIMTESTER_EFTLAB_ATR_DATABASE to a local HTML copy"
+        )
+    return _EFTLAB_ATR_CACHE
 
 
 def lookup_atr_database(atr: bytes, database_text: str | None) -> list[str]:
@@ -599,8 +692,8 @@ def detect_sim_vendor(atr: bytes, manufacturer_area: bytes | None,
         upper_description = description.upper().encode("ascii", "ignore")
         for marker, vendor in VENDOR_MARKERS:
             if marker in upper_description:
-                return vendor, f"pcsc-tools ATR database: {description}"
-        return description, f"matched pcsc-tools ATR database ({ATR_DATABASE_URL})"
+                return vendor, f"public ATR database match: {description}"
+        return description, f"matched public ATR database ({ATR_DATABASE_URL} / {EFTLAB_ATR_URL})"
     for marker, vendor in VENDOR_MARKERS:
         if marker in evidence:
             return vendor, f"matched marker {marker.decode('ascii')} in ATR/manufacturer data"
@@ -765,11 +858,16 @@ def collect_sim_summary(transport: CardTransport,
         gemxpresso = _file_exists(transport, (0x3F00, 0x5F11))
         atr_value = bytes.fromhex(summary["ATR"]) if summary["ATR"] != "unavailable" else b""
         database_text, database_source = load_atr_database() if use_atr_database else (None, "disabled")
-        summary["ATR database source"] = database_source
-        database_matches = lookup_atr_database(atr_value, database_text)
+        eftlab_text, eftlab_source = load_eftlab_atr_database() if use_atr_database else (None, "disabled")
+        summary["pcsc-tools ATR source"] = database_source
+        summary["EFTLab ATR source"] = eftlab_source
+        pcsc_matches = lookup_atr_database(atr_value, database_text)
+        eftlab_matches = lookup_atr_database(atr_value, eftlab_text)
+        database_matches = pcsc_matches + [match for match in eftlab_matches if match not in pcsc_matches]
         summary["ATR database match"] = " | ".join(database_matches[:3]) if database_matches else "none"
+        combined_database = "\n".join(part for part in (database_text, eftlab_text) if part)
         vendor, evidence = detect_sim_vendor(
-            atr_value, manufacturer, gemxpresso, database_text
+            atr_value, manufacturer, gemxpresso, combined_database
         )
         summary["SIM vendor"] = vendor
         summary["Vendor evidence"] = evidence
@@ -811,7 +909,8 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
     """Probe CLA/INS values, tracing every exchange and yielding supported ones."""
     if retries < 0 or max_consecutive_errors < 1:
         raise ValueError("retries must be non-negative and max errors must be positive")
-    predicate = interesting or (lambda response: response.sw not in {0x6E00, 0x6D00, 0x6881, 0x6882})
+    def predicate(command: bytes, response: APDUResponse) -> bool:
+        return interesting(response) if interesting is not None else analyze_apdu_response(command, response).interesting
     total = 256 * 256 if level2 else 256
     sequence = 0
     consecutive_errors = 0
@@ -869,13 +968,17 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                 followups += 1
                 if trace is not None:
                     trace(sequence, total, get_response, followup,
-                          predicate(response) if response.sw1 != 0x61 else None)
+                          predicate(command, response) if response.sw1 != 0x61 else None)
                 response_traced = True
-            is_interesting = predicate(response)
+            is_interesting = predicate(command, response)
             if trace is not None and not response_traced:
                 trace(sequence, total, command, response, is_interesting)
             if is_interesting:
                 yield ScanFinding(cla << 8 | instruction, response)
+            if level2 and response.sw == 0x6E00:
+                # CLA is rejected, so the remaining 255 INS probes cannot add
+                # information for this class.
+                break
 
 
 def tar_values(ranges: Iterable[tuple[int, int]], start: int = 0) -> Iterator[int]:
@@ -961,10 +1064,11 @@ def _run_scan(reader: int, level2: bool) -> None:
             return
         data = response.data.hex().upper() or "<empty>"
         info = decode_status_word(response.sw1, response.sw2)
+        analysis = analyze_apdu_response(command, response)
         status_counts[response.sw] += 1
         result = "follow-up" if found is None else ("FOUND" if found else "filtered")
         print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
-              f"{result} - {info.meaning} [{info.standard}]", flush=True)
+              f"{result} - {info.meaning} [{info.standard}] ANALYSIS={analysis.conclusion}", flush=True)
 
     transport = PCSCTransport(reader)
     apdu_format = detect_apdu_format(transport)
@@ -996,9 +1100,12 @@ def _run_scan(reader: int, level2: bool) -> None:
             for finding in findings:
                 response = finding.response
                 info = decode_status_word(response.sw1, response.sw2)
+                command = bytes((finding.value >> 8, finding.value & 0xFF, 0, 0))
+                analysis = analyze_apdu_response(command, response)
                 print(f"  CLA={finding.value >> 8:02X} INS={finding.value & 0xFF:02X} "
                       f"APDU={finding.value:04X}0000 SW={response.sw:04X} "
-                      f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
+                      f"DATA={response.data.hex().upper() or '<empty>'} SEVERITY={analysis.severity} "
+                      f"- {info.meaning}; {analysis.conclusion}; NEXT={analysis.next_step}", flush=True)
         else:
             print("  None", flush=True)
         print("Standards basis: ISO/IEC 7816-4, ETSI TS 102 221/102 223, "
@@ -1190,6 +1297,13 @@ def run_self_tests() -> int:
         assert decode_status_word(0x69, 0x86).category == "supported-command"
         assert "3 retries" in decode_status_word(0x63, 0xC3).meaning
         assert "256" in decode_status_word(0x61, 0x00).meaning
+        assert analyze_apdu_response(bytes.fromhex("00240000"), APDUResponse(b"", 0x67, 0)).interesting
+        assert "recognized" in analyze_apdu_response(
+            bytes.fromhex("00200000"), APDUResponse(b"", 0x6B, 0)
+        ).conclusion
+        assert not analyze_apdu_response(
+            bytes.fromhex("006D0000"), APDUResponse(b"", 0x6D, 0)
+        ).interesting
 
     @check("61xx automatically issues GET RESPONSE")
     def _get_response() -> None:
@@ -1263,6 +1377,15 @@ def run_self_tests() -> int:
         assert trace_log[14][2] == bytes.fromhex("07000000")
         assert trace_log[14][3] is None
         assert trace_log[15][4] is True
+        calls = 0
+
+        def unsupported_cla(_apdu: bytes) -> APDUResponse:
+            nonlocal calls
+            calls += 1
+            return APDUResponse(b"", 0x6E, 0)
+
+        assert list(scan_apdus(MockTransport(unsupported_cla), level2=True)) == []
+        assert calls == 256
 
     @check("APDU scan retries and skips communication errors")
     def _apdu_retry() -> None:
@@ -1343,6 +1466,10 @@ def run_self_tests() -> int:
         assert lookup_atr_database(bytes.fromhex("3B1094"), database) == ["Gemalto test UICC"]
         db_vendor = detect_sim_vendor(bytes.fromhex("3B1094"), None, atr_database_text=database)
         assert db_vendor[0] == "Gemalto/Thales"
+        eftlab = _eftlab_html_to_database(
+            "<table><tr><td>3B 10 94</td><td>Thales demo UICC</td></tr></table>"
+        )
+        assert lookup_atr_database(bytes.fromhex("3B1094"), eftlab) == ["Thales demo UICC"]
 
     @check("PIN2 and PUK2 fall back from UICC to classic references")
     def _credential_fallback() -> None:
