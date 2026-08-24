@@ -1,0 +1,65 @@
+# Python port and source audit
+
+This repository contains a clean-room Python implementation in the single
+standalone `simtester.py` script. Its classes still keep protocol encoding
+separate from card I/O, while one file and one menu make the complete tool easy
+to copy, run, and test without a physical SIM.
+
+## Useful approaches found in the Java source
+
+* `CommandPacket` models the TS 03.48 fields explicitly and varies SPI, KIC,
+  KID, keyset, counter policy, PoR mode, and TAR independently. The Python
+  `CommandPacket` retains this approach and validates every bounded field.
+* `ResponsePacket` recognizes standard `027100` and proprietary `027F00`
+  responses, can locate a packet embedded in other bytes, honors declared
+  lengths, and distinguishes checksum, padding, and additional response data.
+* `FuzzerFactory` uses a small, intentional matrix rather than random bytes.
+  Its 17 mechanisms cover counter policy and implicit/DES/2-key and 3-key 3DES
+  identifiers, with plain and ciphered PoR variants. This remains a useful plan
+  for authorized testing; the Python packet object exposes all these controls.
+* `TARScanner` supports exhaustive, ranged, resumable, and baseline-response
+  scans. Python exposes lazy TAR range and packet generators so callers can add
+  persistence and response classification without allocating millions of items.
+* `APDUScanner` first scans CLA and optionally scans all INS values only at
+  level 2. It filters the standard unsupported-class/instruction status words.
+  `scan_apdus` preserves that strategy and permits a custom finding predicate.
+* `FileScanner` traverses the MF/DF/ADF hierarchy, skips reserved identifiers,
+  optionally restricts candidates by standard file-ID ranges, and uses reported
+  child counts as an early exit. This is valuable but remains transport/card-
+  state-specific and is not yet in the Python port.
+* The Java transport centralizes APDU transmission and card reconnect behavior.
+  Python replaces global state with a `CardTransport` protocol, a deterministic
+  mock, and an optional PC/SC implementation.
+
+## Implemented Python functionality
+
+* Strict TS 03.48 command construction and parsing for the non-cryptographic,
+  fuzzer-compatible packet form.
+* Strict/lenient response parsing, including embedded and proprietary packets.
+* Lazy TAR range generation, OTA packet generation, APDU level 1/2 scanning.
+* PC/SC hardware access through optional `pyscard`, plus a dependency-free mock.
+* A single interactive menu for building/parsing packets, previewing TAR scans,
+  listing readers, and starting APDU level 1 or level 2 scans.
+* Non-interactive subcommands for automation and dependency-free self-tests.
+
+There is nothing to install and no second Python source file. Examples:
+
+```console
+python simtester.py build-ota B00010 --keyset 1 --data A0A40000023F00
+python simtester.py parse-response 027100000B0AB0001000000000010000
+python simtester.py scan-apdu --reader 0
+python simtester.py self-test
+```
+
+Run `python simtester.py` without arguments to open the menu. All Python code,
+including its dependency-free self-tests, is contained in that one script.
+
+## Scope and safety
+
+This is an independent implementation, not a line-for-line translation. It
+does not silently pretend to encrypt or sign packets: real cryptographic OTA
+operations require legitimate operator keys and are intentionally outside the
+initial port. PIN mutation, GSM authentication collection, OTA SMS envelope
+delivery, file-system traversal, proactive command handling, and network upload
+also remain future work. Only test cards and systems you own or are authorized
+to assess.

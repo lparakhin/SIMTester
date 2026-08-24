@@ -1,5 +1,11 @@
 # SIMTester
 
+> **Python implementation:** A dependency-light clean-room port of the packet
+> codecs, transport abstraction, TAR generation, and APDU scanner is combined in
+> the single `simtester.py` script. Run `python simtester.py` for an interactive
+> menu or `python simtester.py self-test` for its built-in tests. No installation
+> or additional Python source files are required. See [PYTHON_PORT.md](PYTHON_PORT.md).
+
 SIMTester assess SIM card security in two dimensions:
 
 - **Cryptanalytic attack surface**: Collect cryptographic signatures and encryptions of known plaintexts
