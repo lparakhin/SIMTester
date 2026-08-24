@@ -6,3 +6,6 @@
 .idea/
 
 out/
+
+__pycache__/
+*.pyc

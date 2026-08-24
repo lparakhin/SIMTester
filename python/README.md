@@ -43,6 +43,30 @@ python -m simtester                         # full OTA security fuzzing (default
 CLI flags mirror the original Java tool (`-t`, `-k`, `-f`, `-st`, `-str`,
 `-sa`, `-sf`, `-of`, `-qf`, `-poke`, `-gsmmap`, `-2g`, ...) - see `--help`.
 
+## Single-file version
+
+`simtester_standalone.py` bundles every module from `simlib/` and
+`simtester/` into one self-contained script - copy just that one file
+anywhere and run it, no package directory needed:
+
+```
+python3 simtester_standalone.py --help
+```
+
+It works by base64-embedding each module's source verbatim and installing an
+in-memory `sys.meta_path` import hook that reconstructs the `simlib`/
+`simtester` packages at startup, so it behaves identically to the multi-file
+version (same code, same import semantics) - just packaged differently.
+Runtime dependencies (`pyscard`, `pycryptodome`, `requests`) are still only
+imported lazily where actually needed, exactly as in the modular source.
+
+It's generated, not hand-written - after editing `simlib/`/`simtester/`,
+regenerate it with:
+
+```
+python3 build_single_file.py
+```
+
 ## Notes on the port
 
 - Byte handling uses plain Python `bytes`/`bytearray` instead of Java's
