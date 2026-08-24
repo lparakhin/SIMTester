@@ -281,6 +281,10 @@ class APDUResponse:
     sw1: int
     sw2: int
 
+    def __post_init__(self) -> None:
+        if not 0 <= self.sw1 <= 0xFF or not 0 <= self.sw2 <= 0xFF:
+            raise ValueError("status-word bytes must be between 00 and FF")
+
     @property
     def sw(self) -> int:
         return self.sw1 << 8 | self.sw2
@@ -344,12 +348,29 @@ def analyze_apdu_response(command: bytes, response: APDUResponse) -> ResponseAna
 
 def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
     """Decode ISO/ETSI/3GPP UICC status words also used by GSMA profiles."""
+    if not 0 <= sw1 <= 0xFF or not 0 <= sw2 <= 0xFF:
+        raise ValueError("status-word bytes must be between 00 and FF")
     sw = sw1 << 8 | sw2
     exact = {
         0x9000: ("Command completed successfully", "success"),
+        0x6200: ("Warning: non-volatile memory unchanged; no further information", "warning"),
         0x6282: ("End of file or record reached before reading Le bytes", "warning"),
         0x6283: ("Selected file invalidated/deactivated", "warning"),
         0x6285: ("Selected file is in termination state", "warning"),
+        0x62F1: ("More data available", "response-available"),
+        0x62F2: ("More data available and proactive command pending", "proactive"),
+        0x62F3: ("Response data may be corrupted", "warning"),
+        0x62F5: ("Default agent locked", "warning"),
+        0x62F7: ("Card/application life-cycle state does not permit the command", "warning"),
+        0x62F8: ("Referenced data not found", "warning"),
+        0x62F9: ("Application selection failed", "warning"),
+        0x63F1: ("More data expected", "warning"),
+        0x63F2: ("More data expected and proactive command pending", "proactive"),
+        0x6400: ("Execution error; non-volatile memory unchanged", "error"),
+        0x6401: ("Immediate response required by the card", "error"),
+        0x6500: ("Execution error; non-volatile memory changed", "error"),
+        0x6581: ("Memory failure", "error"),
+        0x6600: ("Security-related issue", "security"),
         0x6700: ("Wrong command length", "error"),
         0x6881: ("Logical channel not supported", "unsupported"),
         0x6882: ("Secure messaging not supported", "unsupported"),
@@ -358,12 +379,14 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         0x6984: ("Referenced data invalidated", "security"),
         0x6985: ("Conditions of use not satisfied", "security"),
         0x6986: ("Command not allowed (no current EF or command context)", "supported-command"),
+        0x6987: ("Expected secure-messaging data objects missing", "security"),
         0x6988: ("Secure messaging data objects incorrect", "security"),
         0x6A80: ("Incorrect parameters in command data", "supported-command"),
         0x6A81: ("Function not supported", "unsupported"),
         0x6A82: ("File or application not found", "supported-command"),
         0x6A83: ("Record not found", "supported-command"),
         0x6A84: ("Not enough memory space", "error"),
+        0x6A85: ("Lc inconsistent with TLV structure", "supported-command"),
         0x6A86: ("Incorrect P1/P2 parameters", "supported-command"),
         0x6A87: ("Lc inconsistent with P1/P2", "supported-command"),
         0x6A88: ("Referenced data not found", "supported-command"),
@@ -372,6 +395,7 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         0x6E00: ("Class byte (CLA) not supported", "unsupported"),
         0x6F00: ("No precise diagnosis", "error"),
         0x9300: ("SIM Application Toolkit is busy", "warning"),
+        0x9200: ("Command successful after internal update retry", "warning"),
         0x9400: ("No EF selected", "supported-command"),
         0x9402: ("Out of range or invalid address", "supported-command"),
         0x9404: ("File ID or pattern not found", "supported-command"),
@@ -407,6 +431,9 @@ def decode_status_word(sw1: int, sw2: int) -> StatusWordInfo:
         return StatusWordInfo("Execution error; non-volatile memory unchanged", "error", "ISO/IEC 7816-4")
     if sw1 == 0x65:
         return StatusWordInfo("Execution error; non-volatile memory changed", "error", "ISO/IEC 7816-4")
+    if sw1 == 0x92:
+        return StatusWordInfo(f"Command successful after {sw2 & 0x0F} internal update retries",
+                              "warning", "3GPP TS 11.11 legacy SIM")
     if sw1 == 0x6C:
         return StatusWordInfo(f"Wrong Le; exact length is {sw2 or 256}", "supported-command", "ISO/IEC 7816-4")
     return StatusWordInfo("Unknown or application-specific status word", "unknown",
@@ -997,6 +1024,35 @@ APDUTraceValue = APDUResponse | Exception | None
 APDUTrace = Callable[[int, int, bytes, APDUTraceValue, bool | None], None]
 
 
+def with_correct_le(command: bytes, le: int) -> bytes:
+    """Return a corrected short APDU after a 6Cxx response.
+
+    A four-byte case-1 command becomes case 2.  For case 2/4 the final Le is
+    replaced; case-3 commands gain Le and become case 4.  Extended APDUs are
+    deliberately rejected because a two-byte Le cannot be inferred from SW2.
+    ``le=256`` is encoded as the short-APDU sentinel 00.
+    """
+    if len(command) < 4:
+        raise ValueError("APDU must contain CLA, INS, P1 and P2")
+    if not 1 <= le <= 256:
+        raise ValueError("short APDU Le must be between 1 and 256")
+    encoded_le = le & 0xFF
+    if len(command) == 4:
+        return command + bytes((encoded_le,))
+    if command[4] == 0:
+        if len(command) == 5:  # short case 2 with Le=256
+            return command[:4] + bytes((encoded_le,))
+        raise ValueError("cannot correct Le on an extended APDU from SW2")
+    lc = command[4]
+    if len(command) == 5:  # short case 2
+        return command[:4] + bytes((encoded_le,))
+    if len(command) == 5 + lc:  # short case 3
+        return command + bytes((encoded_le,))
+    if len(command) == 6 + lc:  # short case 4
+        return command[:-1] + bytes((encoded_le,))
+    raise ValueError("malformed short APDU length")
+
+
 def scan_apdus(transport: CardTransport, *, level2: bool = False,
                interesting: Callable[[APDUResponse], bool] | None = None,
                trace: APDUTrace | None = None, retries: int = 2,
@@ -1046,13 +1102,28 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                     )
                 continue
             consecutive_errors = 0
+            # 6Cxx is an explicit correction, not a command failure.  Retry
+            # once using the card-provided short Le (SW2=00 means 256).
+            if response.sw1 == 0x6C:
+                try:
+                    corrected = with_correct_le(command, response.sw2 or 256)
+                except ValueError:
+                    corrected = b""
+                if corrected:
+                    if trace is not None:
+                        trace(sequence, total, command, response, None)
+                    corrected_response, last_error = transmit(corrected, sequence)
+                    if corrected_response is not None:
+                        command = corrected
+                        response = corrected_response
             combined_data = response.data
             followups = 0
             response_traced = False
-            while response.sw1 == 0x61 and followups < 8:
+            while response.sw1 in (0x61, 0x9F) and followups < 8:
                 if trace is not None and followups == 0:
                     trace(sequence, total, command, response, None)
-                # ISO/IEC 7816-4 GET RESPONSE. SW2=00 encodes the maximum short Le.
+                # ISO/UICC 61xx and classic-SIM 9Fxx both request GET RESPONSE.
+                # SW2=00 encodes the maximum short Le.
                 get_response = bytes((command[0], 0xC0, 0x00, 0x00, response.sw2))
                 followup, last_error = transmit(get_response, sequence)
                 if followup is None:
@@ -1063,7 +1134,7 @@ def scan_apdus(transport: CardTransport, *, level2: bool = False,
                 followups += 1
                 if trace is not None:
                     trace(sequence, total, get_response, followup,
-                          predicate(command, response) if response.sw1 != 0x61 else None)
+                          predicate(command, response) if response.sw1 not in (0x61, 0x9F) else None)
                 response_traced = True
             is_interesting = predicate(command, response)
             if trace is not None and not response_traced:
@@ -1767,6 +1838,15 @@ def run_self_tests() -> int:
         assert decode_status_word(0x69, 0x86).category == "supported-command"
         assert "3 retries" in decode_status_word(0x63, 0xC3).meaning
         assert "256" in decode_status_word(0x61, 0x00).meaning
+        assert decode_status_word(0x69, 0x87).category == "security"
+        assert "TLV" in decode_status_word(0x6A, 0x85).meaning
+        assert "7 internal" in decode_status_word(0x92, 0x07).meaning
+        try:
+            decode_status_word(0x100, 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range SW1 accepted")
         assert analyze_apdu_response(bytes.fromhex("00240000"), APDUResponse(b"", 0x67, 0)).interesting
         assert "recognized" in analyze_apdu_response(
             bytes.fromhex("00200000"), APDUResponse(b"", 0x6B, 0)
@@ -1791,6 +1871,26 @@ def run_self_tests() -> int:
         assert commands[:2] == [bytes.fromhex("00000000"), bytes.fromhex("00C0000003")]
         assert findings[0].response.data == b"XYZ"
         assert findings[0].response.sw == 0x9000
+
+    @check("short APDU cases and 6C correction")
+    def _correct_le() -> None:
+        assert with_correct_le(bytes.fromhex("00CA0000"), 256) == bytes.fromhex("00CA000000")
+        assert with_correct_le(bytes.fromhex("00CA000010"), 4) == bytes.fromhex("00CA000004")
+        assert with_correct_le(bytes.fromhex("00DA000002AABB"), 3) == bytes.fromhex("00DA000002AABB03")
+        assert with_correct_le(bytes.fromhex("00DA000002AABB10"), 3) == bytes.fromhex("00DA000002AABB03")
+        commands: list[bytes] = []
+
+        def wrong_le_card(apdu: bytes) -> APDUResponse:
+            commands.append(apdu)
+            if apdu == bytes.fromhex("00000000"):
+                return APDUResponse(b"", 0x6C, 0x02)
+            if apdu == bytes.fromhex("0000000002"):
+                return APDUResponse(b"OK", 0x90, 0x00)
+            return APDUResponse(b"", 0x6E, 0x00)
+
+        findings = list(scan_apdus(MockTransport(wrong_le_card)))
+        assert commands[:2] == [bytes.fromhex("00000000"), bytes.fromhex("0000000002")]
+        assert findings[0].response == APDUResponse(b"OK", 0x90, 0x00)
 
     @check("TAR generation is inclusive and resumable")
     def _tar_generation() -> None:
