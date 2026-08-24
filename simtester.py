@@ -15,8 +15,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Protocol, Sequence
 
-__version__ = "0.4.3"
-BUILD_ID = "get-data-concise-v14"
+__version__ = "0.4.4"
+BUILD_ID = "context-status-detail-v15"
 
 
 class PacketError(ValueError):
@@ -1475,6 +1475,8 @@ def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
                 kind = "DF/ADF" if value and value[0] & 0x38 == 0x38 else "EF/other"
                 shareable = "shareable" if value and value[0] & 0x40 else "not shareable"
                 details.append(f"File descriptor={raw} ({kind}, {shareable})")
+                if len(value) > 1:
+                    details.append(f"File descriptor data-coding byte={value[1]:02X}")
             elif tag == 0x83 and len(value) == 2:
                 fid = int.from_bytes(value, "big")
                 details.append(f"File identifier={fid:04X}" + (" (MF)" if fid == 0x3F00 else ""))
@@ -1483,6 +1485,10 @@ def decode_uicc_status_data(data: bytes) -> tuple[str, ...]:
                 details.append(f"Life-cycle status={value[0]:02X} ({state})")
             elif tag == 0x8B:
                 details.append(f"Security attributes (compact)={raw}")
+                if value:
+                    conditions = value[1:].hex().upper() or "none"
+                    details.append(f"Compact security: access-mode byte={value[0]:02X}, "
+                                   f"security-condition bytes={conditions}")
             elif tag == 0xA5:
                 for nested_tag, nested_value in _ber_tlvs(value):
                     nested_raw = nested_value.hex().upper()
@@ -1554,6 +1560,22 @@ def decode_tar_context_response(name: str, response: APDUResponse) -> tuple[str,
     """Return human-readable context data/status details without overclaiming."""
     if name.startswith("STATUS") and response.sw == 0x9000:
         return decode_uicc_status_data(response.data)
+    if name.startswith("STATUS"):
+        info = decode_status_word(response.sw1, response.sw2)
+        if response.sw == 0x6E00:
+            interpretation = "Interpretation: STATUS CLA is not supported by this card/application"
+        elif response.sw == 0x6D00:
+            interpretation = "Interpretation: STATUS instruction is not supported for the selected CLA"
+        elif response.sw1 == 0x6C:
+            interpretation = f"Interpretation: STATUS requires Le={response.sw2 or 256} byte(s)"
+        elif response.sw in (0x6982, 0x6985):
+            interpretation = "Interpretation: STATUS is recognized but blocked by security/card state"
+        elif response.sw in (0x6A86, 0x6B00):
+            interpretation = "Interpretation: STATUS is recognized but P1/P2 is not accepted"
+        else:
+            interpretation = "Interpretation: STATUS returned no usable FCP/status data"
+        return (f"Status word={response.sw:04X} ({info.meaning})", interpretation,
+                "Scope: card/application context only; TAR/MSL/PoR results are unaffected")
     if name.startswith("GET DATA") and response.sw == 0x9000:
         return decode_card_recognition_data(response.data)
     if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
@@ -1569,11 +1591,21 @@ def summarize_tar_context_response(name: str, response: APDUResponse,
                   "Available memory=", "PIN status template:")
         selected = [detail for detail in decoded if detail.startswith(wanted)]
         return "STATUS OK: " + "; ".join(selected or ("FCP returned but no standard fields decoded",))
+    if name.startswith("STATUS"):
+        info = decode_status_word(response.sw1, response.sw2)
+        interpretation = next((detail.removeprefix("Interpretation: ") for detail in decoded
+                               if detail.startswith("Interpretation: ")), "no status data returned")
+        return f"STATUS unavailable: SW={response.sw:04X} ({info.meaning}); {interpretation}"
     if name.startswith("GET DATA") and response.sw == 0x9000:
         templates = [detail for detail in decoded if "template:" in detail]
         capabilities = sum("capabilit" in detail.lower() for detail in decoded)
         suffix = f"; capability field(s)={capabilities}" if capabilities else ""
-        return "GET DATA OK: " + "; ".join(templates or (f"{len(response.data)} byte(s) returned",)) + suffix
+        successful = next((detail for detail in decoded
+                           if detail.startswith("Attempt ") and "SW=9000" in detail), "")
+        match = re.search(r"APDU=([0-9A-F]{2})", successful)
+        via = f"; via CLA={match.group(1)}" if match else ""
+        return ("GET DATA OK: " + "; ".join(templates or (f"{len(response.data)} byte(s) returned",))
+                + suffix + via)
     if name.startswith("GET DATA") and response.sw in (0x6A81, 0x6A88, 0x6D00, 0x6E00):
         attempts = [detail for detail in decoded if detail.startswith("Attempt ")]
         statuses = ", ".join(
@@ -1598,6 +1630,9 @@ def analyze_tar_context_response(name: str, command: bytes,
         if response.sw1 == 0x6C:
             return ResponseAnalysis(True, "medium", "UICC STATUS recognized, but corrected Le was not accepted",
                                     f"Card continues to request Le={response.sw2 or 256}; do not infer TAR support")
+        info = decode_status_word(response.sw1, response.sw2)
+        return ResponseAnalysis(False, "none", f"STATUS did not return usable context: {info.meaning}",
+                                "Review the decoded SW and attempted APDU; TAR/MSL/PoR results are unaffected")
     if name.startswith("GET DATA") and response.sw in (0x6D00, 0x6E00, 0x6A81, 0x6A88):
         return ResponseAnalysis(False, "none",
                                 "GET DATA alternatives exhausted without object 0066",
@@ -1613,7 +1648,12 @@ def probe_tar_scan_context(transport: CardTransport,
     status_name = "STATUS current UICC application" if apdu_format.third_gen else "STATUS current SIM application"
     status_command = bytes.fromhex("80F2000000" if apdu_format.third_gen else "A0F2000000")
     status_response, status_exchanges = _card_command_trace(transport, status_command)
-    status_decoded = decode_tar_context_response(status_name, status_response)
+    status_attempts = tuple(
+        f"Attempt STATUS APDU={command.hex().upper()} -> SW={response.sw:04X} "
+        f"({decode_status_word(response.sw1, response.sw2).meaning})"
+        for command, response in status_exchanges
+    )
+    status_decoded = status_attempts + decode_tar_context_response(status_name, status_response)
     results = [TARContextResult(
         status_name, status_command, status_response,
         analyze_tar_context_response(status_name, status_command, status_response),
@@ -2571,6 +2611,13 @@ def run_self_tests() -> int:
         assert short.startswith("STATUS OK:")
         assert "File identifier=3F00 (MF)" in short
         assert "Available memory=273872 byte(s)" in short
+        status_denied = APDUResponse(b"", 0x69, 0x82)
+        denied_decoded = decode_tar_context_response("STATUS current UICC application", status_denied)
+        assert "blocked by security/card state" in denied_decoded[1]
+        assert summarize_tar_context_response(
+            "STATUS current UICC application", status_denied, denied_decoded
+        ) == ("STATUS unavailable: SW=6982 (Security status not satisfied); "
+              "STATUS is recognized but blocked by security/card state")
         get_data = decode_tar_context_response(
             "GET DATA card recognition data", APDUResponse(b"", 0x6D, 0x00)
         )
@@ -2606,6 +2653,7 @@ def run_self_tests() -> int:
         )[1]
         assert fallback.response == APDUResponse(recognition, 0x90, 0)
         assert fallback.command == bytes.fromhex("80CA006600")
+        assert "via CLA=80" in fallback.short_decoded
         assert any("APDU=00CA006600 -> SW=6E00" in detail for detail in fallback.decoded)
         assert any("APDU=80CA006600 -> SW=9000" in detail for detail in fallback.decoded)
 
