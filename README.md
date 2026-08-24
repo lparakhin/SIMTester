@@ -26,7 +26,7 @@
 > while PID-independent behavior is called out and never treated as OTA execution.
 > TAR scans always request PoR and add analyzed STATUS/GET DATA context probes.
 > Corrected-Le exchanges are logged, while repeated no-PoR `62xx` baselines are collapsed.
-> Use `python simtester.py --version`; current scans identify build `apdu-response-analysis-v7`.
+> Use `python simtester.py --version`; current scans identify build `tar-existence-any-msl-v8`.
 > STATUS FCP responses decode MF/file, lifecycle, memory, security, and PIN-reference fields.
 > Every STATUS/GET DATA result includes a one-line COMPACT answer and an EXPANDED
 > field-level decode with the raw response retained for auditing. UICC GET DATA
@@ -38,6 +38,9 @@
 > APDU, SMS-PP DOWNLOAD `D1` template, SMS-DELIVER TPDU, and secured command
 > packet before transmission. Summaries correlate responses across profiles and
 > keysets and never treat an empty submit-mode `9000` as proof of OTA execution.
+> TAR scans test every response-capable security profile by default and classify
+> each TAR as CONFIRMED PRESENT, REPORTED UNKNOWN, or INCONCLUSIVE. Confirmation
+> requires a structurally valid PoR whose returned TAR matches the probe.
 > The pcsc-tools and EFTLab ATR inputs are normalized into one lookup index.
 
 SIMTester assess SIM card security in two dimensions:
