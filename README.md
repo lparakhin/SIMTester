@@ -5,6 +5,7 @@
 > the single `simtester.py` script. Run `python simtester.py` for an interactive
 > menu or `python simtester.py self-test` for its built-in tests. No installation
 > or additional Python source files are required. See [PYTHON_PORT.md](PYTHON_PORT.md).
+> APDU scans display every command and response on screen as they run.
 
 SIMTester assess SIM card security in two dimensions:
 

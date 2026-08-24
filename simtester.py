@@ -221,14 +221,27 @@ class ScanFinding:
     response: APDUResponse
 
 
+APDUTrace = Callable[[int, int, bytes, APDUResponse | None, bool | None], None]
+
+
 def scan_apdus(transport: CardTransport, *, level2: bool = False,
-               interesting: Callable[[APDUResponse], bool] | None = None) -> Iterator[ScanFinding]:
-    """Probe CLA and optionally INS values, yielding supported responses."""
+               interesting: Callable[[APDUResponse], bool] | None = None,
+               trace: APDUTrace | None = None) -> Iterator[ScanFinding]:
+    """Probe CLA/INS values, tracing every exchange and yielding supported ones."""
     predicate = interesting or (lambda response: response.sw not in {0x6E00, 0x6D00, 0x6881, 0x6882})
+    total = 256 * 256 if level2 else 256
+    sequence = 0
     for cla in range(256):
         for instruction in range(256) if level2 else (0,):
-            response = transport.transmit(bytes((cla, instruction, 0, 0)))
-            if predicate(response):
+            sequence += 1
+            command = bytes((cla, instruction, 0, 0))
+            if trace is not None:
+                trace(sequence, total, command, None, None)
+            response = transport.transmit(command)
+            is_interesting = predicate(response)
+            if trace is not None:
+                trace(sequence, total, command, response, is_interesting)
+            if is_interesting:
                 yield ScanFinding(cla << 8 | instruction, response)
 
 
@@ -271,13 +284,33 @@ def _print_response(packet: ResponsePacket) -> None:
 
 
 def _run_scan(reader: int, level2: bool) -> None:
+    mode = "level 2 (CLA and INS)" if level2 else "level 1 (CLA)"
+    reader_names = PCSCTransport.readers()
+    if not 0 <= reader < len(reader_names):
+        raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
+    print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
+
+    def screen_trace(sequence: int, total: int, command: bytes,
+                     response: APDUResponse | None, found: bool | None) -> None:
+        if response is None:
+            print(f"[{sequence:05d}/{total:05d}] TX APDU={command.hex().upper()}", flush=True)
+            return
+        data = response.data.hex().upper() or "<empty>"
+        result = "FOUND" if found else "filtered"
+        print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} {result}",
+              flush=True)
+
     transport = PCSCTransport(reader)
+    findings = 0
     try:
-        for finding in scan_apdus(transport, level2=level2):
+        for finding in scan_apdus(transport, level2=level2, trace=screen_trace):
+            findings += 1
             response = finding.response
-            print(f"{finding.value:04X},{response.sw:04X},{response.data.hex().upper()}")
+            print(f"FINDING VALUE={finding.value:04X} SW={response.sw:04X} "
+                  f"DATA={response.data.hex().upper() or '<empty>'}", flush=True)
     finally:
         transport.close()
+        print(f"SCAN END: {findings} potentially supported APDU values found", flush=True)
 
 
 def run_self_tests() -> int:
@@ -312,12 +345,19 @@ def run_self_tests() -> int:
 
     @check("APDU scan filters unsupported classes")
     def _apdu_scan() -> None:
+        trace_log: list[tuple[int, int, bytes, APDUResponse | None, bool | None]] = []
         transport = MockTransport(
             lambda apdu: APDUResponse(b"ok", 0x90, 0) if apdu[0] == 7
             else APDUResponse(b"", 0x6E, 0)
         )
-        findings = list(scan_apdus(transport))
+        findings = list(scan_apdus(
+            transport, trace=lambda *exchange: trace_log.append(exchange)
+        ))
         assert len(findings) == 1 and findings[0].value == 0x0700
+        assert len(trace_log) == 512
+        assert trace_log[14][2] == bytes.fromhex("07000000")
+        assert trace_log[14][3] is None
+        assert trace_log[15][4] is True
 
     failures = 0
     for name, function in checks:

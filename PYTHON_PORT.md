@@ -40,6 +40,8 @@ to copy, run, and test without a physical SIM.
 * PC/SC hardware access through optional `pyscard`, plus a dependency-free mock.
 * A single interactive menu for building/parsing packets, previewing TAR scans,
   listing readers, and starting APDU level 1 or level 2 scans.
+* Live scan logging prints every transmitted APDU and every response data/status
+  word to the screen, including progress, filtered results, and findings.
 * Non-interactive subcommands for automation and dependency-free self-tests.
 
 There is nothing to install and no second Python source file. Examples:
