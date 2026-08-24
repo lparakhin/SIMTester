@@ -50,6 +50,7 @@ def decode_sw(sw1: int, sw2: int) -> str:
         0x6A86: "Incorrect P1/P2",
         0x6D00: "Instruction code not supported",
         0x6E00: "Class not supported",
+        0x6F00: "Technical problem; no precise diagnosis available",
         0x6A84: "Not enough memory space",
         0x6700: "Wrong length",
         0x6881: "Logical channel not supported",
@@ -326,6 +327,60 @@ class SimCardFileView:
     child_efs: int = 0
 
 
+def _ber_length(length: int) -> bytes:
+    if not 0 <= length <= 0xFFFF:
+        raise ValueError("BER-TLV payload is too large")
+    if length < 0x80:
+        return bytes((length,))
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes((0x80 | len(encoded),)) + encoded
+
+
+def build_command_packet(
+    tar: bytes,
+    keyset: int,
+    user_data: bytes = bytes.fromhex("A0A40000023F00"),
+    counter: int = 1,
+    request_por: bool = True,
+    por_cc: bool = True,
+) -> bytes:
+    """Build an unencrypted 3GPP TS 23.048 command packet."""
+    if len(tar) != 3:
+        raise ValueError("TAR must be exactly three bytes")
+    if not 0 <= keyset <= 0x0F:
+        raise ValueError("keyset must be between 0 and 15")
+    if not 0 <= counter < (1 << 40):
+        raise ValueError("counter must fit in five bytes")
+
+    spi1 = 0x00  # no command ciphering/checksum; no counter available
+    spi2 = (0x01 if request_por else 0x00) | (0x08 if request_por and por_cc else 0x00)
+    spi2 |= 0x20  # PoR via SMS-SUBMIT, matching the original TAR scanner
+    command_header = bytes((spi1, spi2, keyset << 4, keyset << 4))
+    command_header += tar + counter.to_bytes(5, "big") + b"\x00"
+    chl = len(command_header)
+    secured_data = bytes((chl,)) + command_header + user_data
+    return b"\x02\x70\x00" + len(secured_data).to_bytes(2, "big") + secured_data
+
+
+def build_sms_pp_download_apdu(command_packet: bytes, pid: int = 0x7F, dcs: int = 0xF6) -> bytes:
+    """Wrap a command packet in a UICC SMS-PP DOWNLOAD ENVELOPE APDU."""
+    if not 0 <= pid <= 0xFF or not 0 <= dcs <= 0xFF:
+        raise ValueError("PID and DCS must be single-byte values")
+    if len(command_packet) > 0xFF:
+        raise ValueError("command packet does not fit in an SMS TP-UD")
+
+    # SMS-DELIVER: UDHI set, fixed test originator, zero SCTS, binary TP-UD.
+    tpdu = b"\x44\x05\x00\x21\x43\xF5" + bytes((pid, dcs)) + (b"\x00" * 7)
+    tpdu += bytes((len(command_packet),)) + command_packet
+    envelope = b"\x82\x02\x83\x81"  # network -> UICC device identities
+    envelope += b"\x86\x05\x00\x21\x43\x65\x87"  # address
+    envelope += b"\x8B" + _ber_length(len(tpdu)) + tpdu
+    data = b"\xD1" + _ber_length(len(envelope)) + envelope
+    if len(data) > 0xFF:
+        raise ValueError("ENVELOPE data requires unsupported extended-length APDU")
+    return b"\x80\xC2\x00\x00" + bytes((len(data),)) + data
+
+
 class ReaderBackend:
     def __init__(self, name: str, allow_dummy: bool = False):
         self.name = name
@@ -406,14 +461,20 @@ class ReaderBackend:
         return resp
 
     def test_tar(self, tar: bytes, keyset: int) -> bytes:
-        # conservative probe payload (SELECT MF) as baseline reachability check
-        _ = (tar, keyset)
-        return self.transmit(bytes.fromhex("00A40000023F00"))
+        packet = build_command_packet(tar, keyset)
+        return self.transmit(build_sms_pp_download_apdu(packet))
 
     def send_ota(self, pid: int, dcs: int, udhi: bool, cph: bytes, keyset: int, tar: str, fuzzer: FuzzerData) -> bytes:
-        # placeholder transport-level OTA probe via APDU path
-        _ = (pid, dcs, udhi, cph, keyset, tar, fuzzer)
-        return self.transmit(bytes.fromhex("00A40000023F00"))
+        _ = (udhi, cph)
+        tar_bytes = bytes.fromhex(tar.split(":", 1)[-1])
+        packet = build_command_packet(
+            tar_bytes,
+            keyset,
+            counter=fuzzer.counter,
+            request_por=fuzzer.request_por,
+            por_cc=fuzzer.request_por,
+        )
+        return self.transmit(build_sms_pp_download_apdu(packet, pid=pid, dcs=dcs))
 
     def select_path(self, path: str) -> SimCardFileView:
         # basic real probe: select by file id on tail
@@ -481,7 +542,7 @@ def tar_scan(reader: ReaderBackend, writer: CSVWriter, mode: str, keyset: int, s
         tar_hex = to_hex(tar)
         tar_desc = tar_human_name(tar_hex)
         for ks in keyset_list:
-            probe_apdu = bytes.fromhex("00A40000023F00")
+            probe_apdu = build_sms_pp_download_apdu(build_command_packet(tar, ks))
             resp = reader.test_tar(tar, ks)
             resp_full = reader.maybe_get_response(probe_apdu, resp)
             hx = to_hex(resp_full)

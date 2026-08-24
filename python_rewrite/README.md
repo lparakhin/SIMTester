@@ -47,6 +47,14 @@ If a reader is present but no card is inserted, the tool now reports a clear per
 
 The TAR menu now includes `scanWellKnownTARs` that uses a curated, cross-vendor TAR catalog (Gemalto/Thales, G+D, IDEMIA/OT, WIB/S@T, generic OTA/RFM).
 
+Each TAR probe is a real UICC SMS-PP DOWNLOAD `ENVELOPE` containing an unencrypted
+3GPP TS 23.048 command packet. The selected three-byte TAR and keyset are encoded
+in that packet; the scanner does not substitute a `SELECT MF` reachability probe.
+An `SW=6F00` response means that the card reported a technical problem without a
+more precise diagnosis. Repeated `6F00` responses are not evidence that a TAR was
+found, and only a successfully parsed proof-of-receipt should be treated as PoR
+support.
+
 
 ## APDU GET RESPONSE support
 
