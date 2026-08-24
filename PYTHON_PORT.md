@@ -76,9 +76,14 @@ by name and validates the selected reader index.
 After every scan, a best-effort SIM card summary reads and decodes ATR, ICCID,
 IMSI, MSISDN, and service-provider name. Both UICC (`00`) and classic SIM (`A0`)
 APDU classes are attempted; protected or absent fields are shown as unavailable.
+ATR details include convention, supported T= protocols, interface bytes,
+historical bytes/text, and TCK where applicable. The summary also states the
+detected 2G/3G format and supported SELECT/ENVELOPE CLA values.
 Before scanning, the selected card is probed with SELECT MF in modern UICC and
 classic SIM forms. The detected 3G (`00`/`80`) or 2G (`A0`) CLA format is then
 used automatically for ENVELOPE and GET RESPONSE commands.
+Scan summaries list only interesting findings; repetitive filtered status words
+remain visible in the live log but are omitted from the final findings section.
 
 There is nothing to install and no second Python source file. Examples:
 

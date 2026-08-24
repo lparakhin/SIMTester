@@ -430,6 +430,46 @@ def _decode_bcd(data: bytes) -> str:
     return digits.rstrip("F")
 
 
+def decode_atr(atr: bytes) -> dict[str, str]:
+    """Decode the ISO/IEC 7816-3 ATR structure into summary fields."""
+    if len(atr) < 2 or atr[0] not in (0x3B, 0x3F):
+        return {"ATR decode": "invalid or unsupported ATR"}
+    result = {"ATR convention": "direct" if atr[0] == 0x3B else "inverse"}
+    t0 = atr[1]
+    historical_length = t0 & 0x0F
+    present = t0 >> 4
+    offset = 2
+    group = 1
+    interface: list[str] = []
+    protocols: set[int] = set()
+    while present and offset < len(atr):
+        for mask, name in ((1, "TA"), (2, "TB"), (4, "TC")):
+            if present & mask and offset < len(atr):
+                interface.append(f"{name}{group}={atr[offset]:02X}")
+                offset += 1
+        if present & 8 and offset < len(atr):
+            td = atr[offset]
+            interface.append(f"TD{group}={td:02X}")
+            protocols.add(td & 0x0F)
+            present = td >> 4
+            offset += 1
+            group += 1
+        else:
+            present = 0
+    historical = atr[offset:offset + historical_length]
+    if not protocols:
+        protocols.add(0)
+    result["ATR protocols"] = ", ".join(f"T={protocol}" for protocol in sorted(protocols))
+    result["ATR interface bytes"] = " ".join(interface) or "none"
+    result["ATR historical bytes"] = historical.hex().upper() or "none"
+    printable = "".join(chr(value) if 32 <= value < 127 else "." for value in historical)
+    result["ATR historical text"] = printable or "none"
+    tck_offset = offset + historical_length
+    if any(protocol != 0 for protocol in protocols):
+        result["ATR TCK"] = f"{atr[tck_offset]:02X}" if tck_offset < len(atr) else "missing"
+    return result
+
+
 def _card_command(transport: CardTransport, command: bytes) -> APDUResponse:
     """Transmit a summary APDU and handle 61xx and 6Cxx responses."""
     response = transport.transmit(command)
@@ -478,14 +518,20 @@ def _read_first_record(transport: CardTransport, path: Sequence[int]) -> bytes |
     return None
 
 
-def collect_sim_summary(transport: CardTransport) -> dict[str, str]:
+def collect_sim_summary(transport: CardTransport,
+                        apdu_format: APDUFormat | None = None) -> dict[str, str]:
     """Best-effort read of common subscriber identity files."""
     summary = {"ATR": "unavailable", "ICCID": "unavailable", "IMSI": "unavailable",
                "MSISDN": "unavailable", "SPN": "unavailable"}
+    if apdu_format is not None:
+        summary["APDU format"] = apdu_format.name
+        summary["Supported command CLA"] = f"SELECT={apdu_format.select_cla:02X}, ENVELOPE={apdu_format.envelope_cla:02X}"
     atr = getattr(transport, "atr", None)
     if atr is not None:
         try:
-            summary["ATR"] = atr().hex().upper()
+            atr_bytes = atr()
+            summary["ATR"] = atr_bytes.hex().upper()
+            summary.update(decode_atr(atr_bytes))
         except Exception:
             pass
     try:
@@ -512,9 +558,10 @@ def collect_sim_summary(transport: CardTransport) -> dict[str, str]:
     return summary
 
 
-def print_sim_summary(transport: CardTransport) -> None:
+def print_sim_summary(transport: CardTransport,
+                      apdu_format: APDUFormat | None = None) -> None:
     print("\n========== SIM CARD SUMMARY ==========", flush=True)
-    for name, value in collect_sim_summary(transport).items():
+    for name, value in collect_sim_summary(transport, apdu_format).items():
         print(f"{name}: {value}", flush=True)
     print("======================================", flush=True)
 
@@ -670,7 +717,6 @@ def _run_scan(reader: int, level2: bool) -> None:
         raise RuntimeError(f"reader {reader} unavailable; found {len(reader_names)}")
     print(f"SCAN START: {mode}; reader {reader}: {reader_names[reader]}", flush=True)
     status_counts: Counter[int] = Counter()
-    category_counts: Counter[str] = Counter()
     error_count = 0
 
     def screen_trace(sequence: int, total: int, command: bytes,
@@ -688,7 +734,6 @@ def _run_scan(reader: int, level2: bool) -> None:
         data = response.data.hex().upper() or "<empty>"
         info = decode_status_word(response.sw1, response.sw2)
         status_counts[response.sw] += 1
-        category_counts[info.category] += 1
         result = "follow-up" if found is None else ("FOUND" if found else "filtered")
         print(f"[{sequence:05d}/{total:05d}] RX DATA={data} SW={response.sw:04X} "
               f"{result} - {info.meaning} [{info.standard}]", flush=True)
@@ -708,7 +753,7 @@ def _run_scan(reader: int, level2: bool) -> None:
         aborted = True
         print(f"SCAN ABORTED: {exc}", flush=True)
     finally:
-        print_sim_summary(transport)
+        print_sim_summary(transport, apdu_format)
         try:
             transport.close()
         except Exception as exc:
@@ -718,14 +763,7 @@ def _run_scan(reader: int, level2: bool) -> None:
         print(f"Responses received: {sum(status_counts.values())}", flush=True)
         print(f"Communication errors/retries: {error_count}", flush=True)
         print(f"Potentially supported APDU values: {len(findings)}", flush=True)
-        print("Status words:", flush=True)
-        for sw, count in status_counts.most_common():
-            info = decode_status_word(sw >> 8, sw & 0xFF)
-            print(f"  SW={sw:04X} COUNT={count} CATEGORY={info.category} - {info.meaning}", flush=True)
-        print("Categories:", flush=True)
-        for category, count in category_counts.most_common():
-            print(f"  {category}: {count}", flush=True)
-        print("Findings:", flush=True)
+        print("Interesting findings only:", flush=True)
         if findings:
             for finding in findings:
                 response = finding.response
@@ -803,22 +841,30 @@ def _run_known_tar_scan(reader: int, keyset: int,
                   f"- {info.meaning}", flush=True)
             results.append((group, tar, response, parsed))
     finally:
-        print_sim_summary(transport)
+        print_sim_summary(transport, apdu_format)
         try:
             transport.close()
         except Exception:
             pass
     parsed_results = [result for result in results if result[3] is not None]
+    interesting_results = [
+        result for result in results
+        if result[3] is not None or result[2].data
+        or result[2].sw not in (0x9000, 0x6D00, 0x6E00)
+    ]
     print(f"\n========== {title} SUMMARY ==========", flush=True)
     print(f"Probes attempted: {len(probe_list)}", flush=True)
     print(f"Card responses: {len(results)}", flush=True)
     print(f"Communication errors/retries: {errors}", flush=True)
     print(f"Parsed OTA response packets: {len(parsed_results)}", flush=True)
-    for group, tar, response, parsed in results:
+    print(f"Interesting findings: {len(interesting_results)}", flush=True)
+    for group, tar, response, parsed in interesting_results:
         info = decode_status_word(response.sw1, response.sw2)
         ota = f" OTA-RSC={parsed.status_code:02X}" if parsed is not None else ""
         print(f"  {group}:{tar} SW={response.sw:04X}{ota} "
               f"DATA={response.data.hex().upper() or '<empty>'} - {info.meaning}", flush=True)
+    if not interesting_results:
+        print("  None", flush=True)
     print("============================================", flush=True)
 
 
@@ -853,7 +899,7 @@ def _run_ota_fuzzing(reader: int, tar: str, keyset: int,
             print(f"  RX={response.data.hex().upper() or '<empty>'} SW={response.sw:04X} "
                   f"- {info.meaning}", flush=True)
     finally:
-        print_sim_summary(transport)
+        print_sim_summary(transport, apdu_format)
         try:
             transport.close()
         except Exception:
@@ -1024,12 +1070,17 @@ def run_self_tests() -> int:
                 }
                 return APDUResponse(files.get(self.selected, b""), 0x90, 0)
 
-        summary = collect_sim_summary(SummaryCard())
+        summary = collect_sim_summary(SummaryCard(), APDUFormat("3G/UICC", True, 0, 0x80))
         assert summary["ATR"] == "3B00"
+        assert summary["ATR convention"] == "direct" and summary["ATR protocols"] == "T=0"
+        assert summary["APDU format"] == "3G/UICC"
+        assert summary["Supported command CLA"] == "SELECT=00, ENVELOPE=80"
         assert summary["ICCID"] == "8901234567890123456"
         assert summary["IMSI"] == "234567890123456"
         assert summary["MSISDN"] == "+1234567890"
         assert summary["SPN"] == "Carrier"
+        t1 = decode_atr(bytes.fromhex("3B800181"))
+        assert t1["ATR protocols"] == "T=1" and t1["ATR TCK"] == "81"
 
     failures = 0
     for name, function in checks:
