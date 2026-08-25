@@ -9,3 +9,6 @@ __pycache__/
 .idea/
 
 out/
+
+__pycache__/
+*.pyc
